@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments & test caches
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment & credentials
+.env*
+!.env.example
+*.pem
+*.key
+*.session*
+tdata/
+
+# Local runtime cache / snapshots / keys
+*.sqlite*
+*.db*
+keys.json

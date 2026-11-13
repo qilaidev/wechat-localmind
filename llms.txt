@@ -1,0 +1,42 @@
+# WeChat LocalMind
+
+> Zero-dependency macOS & Windows WeChat 3.x/4.x local group chat (`@chatroom`) read-only extractor, cleaner, CLI & MCP Server for AI Agents. Strictly 100% offline snapshot processing, physically blocking 1-on-1 private chats (`wxid_*`) and official accounts (`gh_*`), with zero network calls and zero ban risk.
+
+## Documentation
+- [English README](https://github.com/qilaidev/wechat-localmind/blob/main/README.en.md): Full architecture, quickstart, CLI & MCP contracts, and FAQ.
+- [中文 README](https://github.com/qilaidev/wechat-localmind/blob/main/README.md): 完整中文架构说明、快速上手、CLI/MCP 契约与常见问题。
+- [Agent Skill (SKILL.md)](https://github.com/qilaidev/wechat-localmind/blob/main/skills/wechat-localmind/SKILL.md): Ready-to-use AI Agent skill definition and workflow.
+- [Security & Privacy Policy](https://github.com/qilaidev/wechat-localmind/blob/main/SECURITY.md): Triple-layer `@chatroom` guard and read-only compliance guarantees.
+- [Contributing Guide](https://github.com/qilaidev/wechat-localmind/blob/main/CONTRIBUTING.md): Development setup and PR checklist.
+- [MIT License](https://github.com/qilaidev/wechat-localmind/blob/main/LICENSE): Open-source license.
+- [Sister Project: WhatsApp LocalMind](https://github.com/qilaidev/whatsapp-localmind): macOS WhatsApp local group chat read-only extraction layer.
+
+## CLI Subcommands (11)
+1. `wechat-localmind doctor [--format json|md]` — Environment, WeChat 3.x/4.x database discovery, and SQLCipher key health checks.
+2. `wechat-localmind key (--set <hex> | --import <keys.json> | --scan-dump <file>)` — Manage SQLCipher 3/4 decryption keys or scan memory dumps by 16B Salt + HMAC.
+3. `wechat-localmind decrypt` — Decrypt SQLCipher 3/4 databases and force-rebuild the unified plaintext SQLite snapshot.
+4. `wechat-localmind config (show | set-identity --name <name> --wxid <wxid> | block <chat_id> | unblock <chat_id> | ...)` — Manage identity anchor and group blacklist/whitelist rules.
+5. `wechat-localmind groups [--keyword <kw>] [--include-blocked] [--format json|md] [--fresh]` — List accessible `@chatroom` group chats and `latest_msg_id` cursors.
+6. `wechat-localmind list-groups` — Alias for `groups`.
+7. `wechat-localmind fetch --chats (<chat_ids>|ALL_ALLOWED) [--after-id <int> | --since <window>] [--until <ts>] [--context-buffer <int>] [--limit-per-chat <int>] [--no-fold-noise] [--format md|json] [--fresh]` — Fetch cleaned group messages by monotonic cursor or time window.
+8. `wechat-localmind search --query <str> [--chats <ids>] [--since <window>] [--context <int>] [--limit <int>] [--format md|json]` — Search across allowed groups (including `zstd`-compressed XML) with surrounding context.
+9. `wechat-localmind export-media --msg-ids <id1,id2,...> [--format json]` — Export group attachments and auto-decode `.dat` XOR images to `.jpg`/`.png`/`.gif`/`.webp`/`.heic`.
+10. `wechat-localmind clean [--media-only]` — Clean exported media cache or destroy local decrypted snapshot files.
+11. `wechat-localmind mcp-serve` — Start the zero-dependency JSON-RPC 2.0 MCP Server over Stdio.
+12. `wechat-localmind install [--bin-dir <dir>] [--skill-dir <dir>]` — Install CLI symlink and optional `SKILL.md` bundle.
+
+## Read-Only MCP Stdio Tools (4)
+- `wechat_list_groups`: List accessible `@chatroom` groups, member counts, 24h message counts, and `latest_msg_id`.
+- `wechat_fetch_messages`: Fetch cleaned group messages by `after_msg_id` or `since` with 4-tier real-name resolution, `@mention` normalization, 150-char `<refermsg>` quote chains, and revoked-message filtering.
+- `wechat_search_messages`: Full-text search across allowed groups (including `zstd` XML) with surrounding context messages.
+- `wechat_export_media`: Export group attachments by `msg_ids`, auto-decoding `.dat` XOR images and returning absolute local paths.
+
+## Output Contracts & POSIX Exit Codes
+- `stdout`: Pure JSON or Markdown only (pipe-safe for `jq`).
+- `stderr`: Structured error JSON (`error_code`, `exit_code`, `message`).
+- `0` (`EXIT_SUCCESS`): Success.
+- `1` (`EXIT_USAGE_ERROR`): Invalid CLI arguments, time window, or Hex key format.
+- `2` (`EXIT_ENV_OR_PERM_ERROR`): WeChat directory unreadable, missing SQLCipher key, or key mismatch.
+- `3` (`EXIT_POLICY_DENIED`): Privacy guard triggered (attempted access to 1-on-1 `wxid_*` private chat, `gh_*` official account, or blocked group).
+- `4` (`EXIT_RESOURCE_NOT_FOUND`): Target `chat_id` / `msg_id` not found, or media not yet downloaded locally.
+- `5` (`EXIT_INTERNAL_DB_ERROR`): Internal SQLite / SQLCipher parsing error.

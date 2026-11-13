@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Standalone Skill executable wrapper for `wechat-localmind` CLI."""
+
+import sys
+from pathlib import Path
+
+scripts_dir = Path(__file__).resolve().parent
+repo_src = scripts_dir.parent.parent.parent / "src"
+if repo_src.is_dir() and str(repo_src) not in sys.path:
+    sys.path.insert(0, str(repo_src))
+elif str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
+from wx_localmind.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

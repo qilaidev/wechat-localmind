@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+            install-crypto: false
+          - os: ubuntu-latest
+            python-version: "3.11"
+            install-crypto: true
+          - os: ubuntu-latest
+            python-version: "3.12"
+            install-crypto: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Linux AES-CBC backend
+        if: matrix.install-crypto
+        run: python -m pip install cryptography
+
+      - name: Run unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+
+      - name: Smoke-check CLI wrappers
+        run: |
+          ./bin/wechat-localmind --help
+          ./skills/wechat-localmind/scripts/wechat-localmind --help

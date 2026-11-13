@@ -81,6 +81,22 @@ wechat-localmind config set-identity --name "张工" --wxid "wxid_example123456"
 wechat-localmind config block "88888888@chatroom"
 ```
 
+### 8. 清理导出媒体缓存与解密快照 (`clean`)
+清理导出的媒体缓存或销毁本地已解密与统一 SQLite 快照文件：
+```bash
+# 仅清理 snapshot/media/ 下导出的媒体文件，保留 SQLite 快照
+wechat-localmind clean --media-only --format json
+
+# 同时删除导出的媒体缓存与本地 SQLite 快照文件（默认 --all）
+wechat-localmind clean --all --format json
+```
+
+### 9. 启动只读 MCP Stdio Server (`mcp-serve`)
+通过标准输入输出（Stdio）启动只读 Model Context Protocol (MCP) Server：
+```bash
+wechat-localmind mcp-serve [--config <config.json>]
+```
+
 ---
 
 ## 标准流与退出码契约

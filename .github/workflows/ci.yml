@@ -19,13 +19,16 @@ jobs:
         include:
           - os: macos-latest
             python-version: "3.12"
-            install-crypto: false
+            install-deps: false
           - os: ubuntu-latest
             python-version: "3.11"
-            install-crypto: true
+            install-deps: true
           - os: ubuntu-latest
             python-version: "3.12"
-            install-crypto: true
+            install-deps: true
+          - os: windows-latest
+            python-version: "3.12"
+            install-deps: true
 
     steps:
       - name: Checkout
@@ -36,14 +39,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install Linux AES-CBC backend
-        if: matrix.install-crypto
-        run: python -m pip install cryptography
+      - name: Install non-macOS crypto & zstd backends
+        if: matrix.install-deps
+        run: python -m pip install cryptography zstandard
 
       - name: Run unit tests
-        run: PYTHONPATH=src python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s tests -v
 
       - name: Smoke-check CLI wrappers
         run: |
-          ./bin/wechat-localmind --help
-          ./skills/wechat-localmind/scripts/wechat-localmind --help
+          python bin/wechat-localmind --help
+          python skills/wechat-localmind/scripts/wechat-localmind --help

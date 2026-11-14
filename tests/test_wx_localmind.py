@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -29,18 +30,27 @@ from wx_localmind.constants import (
     EXIT_RESOURCE_NOT_FOUND,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
+    _resolve_default_app_support_dir,
 )
 from wx_localmind.crypto import (
     decrypt_sqlcipher_database,
     encrypt_sqlite_to_sqlcipher,
+    encrypt_sqlite_wal_to_sqlcipher,
     extract_keys_from_memory_dump,
 )
-from wx_localmind.media import detect_and_decode_wechat_dat_image
+from wx_localmind.media import (
+    WECHAT4_DAT_MIME_LOCKED,
+    detect_and_decode_wechat_dat_image,
+    encode_wechat4_dat_image,
+)
 from wx_localmind.protobuf_parser import (
+    compress_zstd_bytes,
     decompress_zstd_or_raw,
+    extract_media_path_from_blob,
     parse_protobuf_strings,
     parse_wechat_message_payload,
 )
+from wx_localmind.snapshot import make_ro_sqlite_uri, normalize_epoch_sec
 
 
 def _md5(s: str) -> str:
@@ -557,19 +567,23 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertFalse(lines[2]["result"]["isError"])
 
     def test_09_zstd_native_commoncrypto_and_snr_filtering(self) -> None:
-        """Verify native zstd decompression, CommonCrypto AES-CBC, vectorized PNG XOR, and SNR noise filtering."""
-        # 1. Native Zstandard decompression
-        try:
-            import compression.zstd as std_zstd  # type: ignore
-
-            raw_xml = "wxid_alice:\n<msg><appmsg><type>51</type><title>AI硬件趋势深度解析</title><finderFeed><nickname>硬核科技</nickname><desc>2026最新供应链深度解读</desc></finderFeed></appmsg></msg>"
-            compressed = std_zstd.compress(raw_xml.encode("utf-8"))
+        """Verify zstd decompression, corrupt zstd mojibake guard, vectorized PNG XOR, and SNR noise filtering."""
+        # 1. Zstandard roundtrip (across stdlib / zstandard / ctypes libzstd / CLI)
+        raw_xml = (
+            "wxid_alice:\n<msg><appmsg><type>51</type><title>AI硬件趋势深度解析</title>"
+            "<finderFeed><nickname>硬核科技</nickname><desc>2026最新供应链深度解读</desc></finderFeed>"
+            "</appmsg></msg>"
+        )
+        compressed = compress_zstd_bytes(raw_xml.encode("utf-8"))
+        if compressed is not None:
             parsed = parse_wechat_message_payload(49, None, compressed, None)
             self.assertEqual(parsed.sender_wxid_from_prefix, "wxid_alice")
             self.assertEqual(parsed.normalized_type, "link")
             self.assertIn("[视频号: 硬核科技: 2026最新供应链深度解读]", parsed.text)
-        except ImportError:
-            pass
+
+        # Corrupt ZSTD frame must fail cleanly to "" instead of decoding binary bytes as UTF-16LE mojibake
+        corrupt_zstd = b"\x28\xb5\x2f\xfd\xff\xff\x00\x01\xde\xad\xbe\xef"
+        self.assertEqual(decompress_zstd_or_raw(corrupt_zstd), "")
 
         # 2. Pat ([拍一拍]) and <sysmsg> room notification SNR filtering
         pat_xml = '<sysmsg type="pat"><pat><template><![CDATA["Alice" 拍了拍 "张工"]]></template></pat></sysmsg>'
@@ -591,6 +605,438 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertEqual(mime, "image/png")
         self.assertEqual(key_used, 0xA5)
         self.assertEqual(decoded, raw_png)
+
+    def test_10_privacy_staging_purge_contact_pruning_and_permissions(self) -> None:
+        """Verify decrypted_raw staging is purged, non-group private contacts are pruned, and file perms are 0600/0700."""
+        plain_contact = self.tmp_dir / "plain_contact.db"
+        c_conn = sqlite3.connect(str(plain_contact))
+        c_conn.execute(
+            "INSERT INTO contact VALUES (?, ?, ?, ?, ?)",
+            (8, "wxid_pure_private_friend", "私密好友昵称", "绝密私聊好友备注", "secret_alias"),
+        )
+        c_conn.commit()
+        c_conn.close()
+        encrypt_sqlite_to_sqlcipher(
+            plain_contact,
+            self.contact_dir / "contact.db",
+            self.key_contact,
+            cipher_version=4,
+        )
+
+        code, _, err = self._run_cli(["groups", "--fresh", "--format", "json"])
+        self.assertEqual(code, EXIT_SUCCESS, err)
+
+        # 1. `snapshot/decrypted_raw/` must never remain on disk after snapshot build
+        self.assertFalse((self.snapshot_dir / "decrypted_raw").exists())
+
+        # 2. Pure 1-on-1 private contacts (not in any group) must be pruned from unified snapshot
+        snap_db = self.snapshot_dir / "WeChat_Unified_snapshot.sqlite"
+        self.assertTrue(snap_db.is_file())
+        s_conn = sqlite3.connect(str(snap_db))
+        usernames = {r[0] for r in s_conn.execute("SELECT username FROM wx_contacts").fetchall()}
+        s_conn.close()
+        self.assertNotIn("wxid_pure_private_friend", usernames)
+        self.assertIn("10001@chatroom", usernames)
+        self.assertIn("wxid_alice", usernames)
+
+        # 3. File and directory permissions on POSIX
+        if os.name != "nt":
+            self.assertEqual(self.config_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(snap_db.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.snapshot_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_11_cross_group_quote_isolation_and_path_traversal_defense(self) -> None:
+        """Verify cross-group `<refermsg>` spoofing cannot leak blocked groups and `../` media paths are rejected."""
+        outside_secret = self.tmp_dir / "outside_secret.pdf"
+        outside_secret.write_bytes(b"%PDF-1.4 host secret outside account root")
+
+        spoof_quote_xml = (
+            '<msg><appmsg appid="" sdkver="0">'
+            "<title>试探跨群引用越权</title><type>57</type>"
+            "<refermsg><type>1</type><svrid>80001</svrid>"
+            "<fromusr>wxid_alice</fromusr><displayname>Spoof</displayname>"
+            "<content>客户端本地占位</content></refermsg>"
+            "</appmsg></msg>"
+        )
+        traversal_file_xml = (
+            "<msg><appmsg><title>outside_secret.pdf</title><type>6</type>"
+            "<appattach><fileext>pdf</fileext></appattach>"
+            "</appmsg></msg>"
+        )
+
+        plain_msg0 = self.tmp_dir / "plain_message_0.db"
+        tbl_work = f"Msg_{_md5('10001@chatroom')}"
+        m_conn = sqlite3.connect(str(plain_msg0))
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (11, 90011, 49, self.now_ts - 400, 1, 0, spoof_quote_xml, None, None),
+        )
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                12,
+                90012,
+                49,
+                self.now_ts - 390,
+                1,
+                0,
+                traversal_file_xml,
+                None,
+                _encode_protobuf_field_string(2, "../../../outside_secret.pdf"),
+            ),
+        )
+        m_conn.commit()
+        m_conn.close()
+
+        encrypt_sqlite_to_sqlcipher(
+            plain_msg0,
+            self.msg_dir / "message_0.db",
+            self.key_msg0,
+            cipher_version=4,
+        )
+
+        code, out, err = self._run_cli(["fetch", "--fresh", "--chats", "10001@chatroom", "--since", "24h", "--format", "json"])
+        self.assertEqual(code, EXIT_SUCCESS, err)
+        # Blacklisted group 99999@chatroom server_id=80001 text ("今晚去哪聚餐？") must NEVER leak
+        self.assertNotIn("今晚去哪聚餐", out)
+
+        msgs = json.loads(out)["chats"][0]["messages"]
+        trav_msg = [m for m in msgs if m.get("media") and m["media"].get("title") == "outside_secret.pdf"][0]
+        self.assertFalse(trav_msg["media"]["local_available"])
+        self.assertIsNone(trav_msg["media"]["file_size_bytes"])
+
+        code_exp, _, err_exp = self._run_cli(["export-media", "--msg-ids", str(trav_msg["msg_id"]), "--format", "json"])
+        self.assertEqual(code_exp, EXIT_POLICY_DENIED)
+        self.assertEqual(json.loads(err_exp)["error_code"], "INVALID_SANDBOX_PATH")
+
+    def test_12_incremental_cursor_monotonicity_out_of_order_and_recall(self) -> None:
+        """Verify `--after-id` stays monotonic across row deletions, backdated syncs, and in-place message recalls."""
+        code, out, err = self._run_cli(["fetch", "--chats", "10001@chatroom", "--since", "24h", "--format", "json"])
+        self.assertEqual(code, EXIT_SUCCESS, err)
+        init_payload = json.loads(out)
+        init_latest_id = init_payload["meta"]["global_latest_msg_id"]
+        self.assertEqual(init_latest_id, 11)
+        orig_id_by_text = {m["text"]: m["msg_id"] for m in init_payload["chats"][0]["messages"]}
+
+        plain_msg0 = self.tmp_dir / "plain_message_0.db"
+        tbl_work = f"Msg_{_md5('10001@chatroom')}"
+        tbl_blocked = f"Msg_{_md5('99999@chatroom')}"
+        m_conn = sqlite3.connect(str(plain_msg0))
+        # 1. Delete row in 99999@chatroom (previously shifted all subsequent msg_ids!)
+        m_conn.execute(f"DELETE FROM {tbl_blocked} WHERE local_id = 1")
+        # 2. In-place recall of local_id=4 ("收到") in 10001@chatroom
+        m_conn.execute(
+            f"UPDATE {tbl_work} SET local_type = 10002, message_content = ? WHERE local_id = 4",
+            ('<sysmsg type="revokemsg"><revokemsg><replacemsg><![CDATA["群友" 撤回了一条消息]]></replacemsg></revokemsg></sysmsg>',),
+        )
+        # 3. Insert backdated out-of-order synced message (create_time earlier than existing messages!)
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (11, 90011, 1, self.now_ts - 585, 1, 0, "补同步的历史离线消息", None, None),
+        )
+        # 4. Insert normal newer message
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (12, 90012, 1, self.now_ts - 480, 2, 0, "增量新消息测试", None, None),
+        )
+        m_conn.commit()
+        m_conn.close()
+
+        encrypt_sqlite_to_sqlcipher(
+            plain_msg0,
+            self.msg_dir / "message_0.db",
+            self.key_msg0,
+            cipher_version=4,
+        )
+
+        # Incremental fetch after init_latest_id (11) must return BOTH newly arrived rows with msg_id 12, 13
+        code_inc, out_inc, err_inc = self._run_cli(
+            ["fetch", "--fresh", "--chats", "10001@chatroom", "--after-id", str(init_latest_id), "--format", "json"]
+        )
+        self.assertEqual(code_inc, EXIT_SUCCESS, err_inc)
+        inc_data = json.loads(out_inc)
+        self.assertEqual(inc_data["meta"]["query_mode"], "incremental_cursor")
+        chat_inc = inc_data["chats"][0]
+        self.assertEqual(chat_inc["new_message_count"], 2)
+        new_only = [m for m in chat_inc["messages"] if not m.get("is_context_buffer")]
+        self.assertEqual({m["text"] for m in new_only}, {"补同步的历史离线消息", "增量新消息测试"})
+        for m in new_only:
+            self.assertGreater(m["msg_id"], init_latest_id)
+
+        # Full fetch must show existing msg_ids never shifted and recalled local_id=4 ("收到") is gone
+        code_full, out_full, _ = self._run_cli(["fetch", "--chats", "10001@chatroom", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_full, EXIT_SUCCESS)
+        full_msgs = json.loads(out_full)["chats"][0]["messages"]
+        full_id_by_text = {m["text"]: m["msg_id"] for m in full_msgs}
+        self.assertEqual(
+            full_id_by_text["我已经审阅完毕，马上安排财务。"],
+            orig_id_by_text["我已经审阅完毕，马上安排财务。"],
+        )
+        self.assertNotIn("收到", full_id_by_text)
+
+    def test_13_sqlcipher_wal_merge_pbkdf2_master_key_and_doctor_shard_check(self) -> None:
+        """Verify multi-page SQLCipher `.db-wal` decryption, PBKDF2 master key reuse, and `doctor` shard key check."""
+        # 1. Multi-page SQLCipher 4 `.db` + `.db-wal` merge with uncommitted trailing noise
+        plain_wal_db = self.tmp_dir / "wal_src.db"
+        c_init = sqlite3.connect(str(plain_wal_db))
+        c_init.execute("PRAGMA page_size = 4096;")
+        c_init.execute("VACUUM;")
+        c_init.close()
+        hdr = bytearray(plain_wal_db.read_bytes())
+        hdr[20] = 80
+        struct.pack_into(">H", hdr, 105, 4096 - 80)
+        plain_wal_db.write_bytes(bytes(hdr))
+
+        w_conn = sqlite3.connect(str(plain_wal_db))
+        w_conn.execute("PRAGMA journal_mode = WAL;")
+        w_conn.execute("CREATE TABLE wal_items (id INTEGER PRIMARY KEY, body TEXT);")
+        w_conn.execute("INSERT INTO wal_items VALUES (1, 'seed');")
+        w_conn.commit()
+        w_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        for idx in range(2, 55):
+            w_conn.execute("INSERT INTO wal_items VALUES (?, ?);", (idx, "W" * 300))
+        w_conn.commit()
+
+        salt_wal = os.urandom(16)
+        wal_key = "cd" * 32
+        enc_wal_db = self.tmp_dir / "enc_wal.db"
+        enc_wal_file = Path(f"{enc_wal_db}-wal")
+        encrypt_sqlite_to_sqlcipher(plain_wal_db, enc_wal_db, wal_key, cipher_version=4, salt=salt_wal)
+        encrypt_sqlite_wal_to_sqlcipher(Path(f"{plain_wal_db}-wal"), enc_wal_file, wal_key, salt_wal, cipher_version=4)
+        w_conn.close()
+        # Append uncommitted garbage frame at tail of WAL
+        with open(enc_wal_file, "ab") as wf:
+            wf.write(os.urandom(24 + 4096))
+
+        dec_wal_out = self.tmp_dir / "dec_wal.sqlite"
+        dec_info = decrypt_sqlcipher_database(enc_wal_db, dec_wal_out, [wal_key])
+        self.assertGreaterEqual(dec_info["wal_frames_applied"], 2)
+        v_conn = sqlite3.connect(str(dec_wal_out))
+        self.assertEqual(v_conn.execute("SELECT COUNT(*) FROM wal_items").fetchone()[0], 54)
+        self.assertEqual(v_conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        v_conn.close()
+
+        # 2. PBKDF2 master key (`is_raw_key=False`) memory dump scan must preserve reusable master key across salts
+        master_pass_hex = "ef" * 32
+        shard_a = self.tmp_dir / "shard_a.db"
+        shard_b = self.tmp_dir / "shard_b.db"
+        encrypt_sqlite_to_sqlcipher(
+            self.tmp_dir / "plain_contact.db", shard_a, master_pass_hex, cipher_version=4, is_raw_key=False
+        )
+        encrypt_sqlite_to_sqlcipher(
+            self.tmp_dir / "plain_contact.db", shard_b, master_pass_hex, cipher_version=4, is_raw_key=False
+        )
+        salt_a = shard_a.read_bytes()[:16]
+        dump_bytes = os.urandom(64) + bytes.fromhex(master_pass_hex) + salt_a + os.urandom(64)
+        found_keys = extract_keys_from_memory_dump(dump_bytes, [shard_a])
+        self.assertEqual(found_keys.get("shard_a.db"), master_pass_hex)
+        dec_b = decrypt_sqlcipher_database(shard_b, self.tmp_dir / "dec_b.sqlite", [found_keys["shard_a.db"]])
+        self.assertEqual(dec_b["cipher_version"], 4)
+
+        # 3. `doctor` must fail closed if a newly rotated `message_1.db` shard lacks a valid key
+        encrypt_sqlite_to_sqlcipher(
+            self.tmp_dir / "plain_message_0.db",
+            self.msg_dir / "message_1.db",
+            "99" * 32,
+            cipher_version=4,
+        )
+        code_doc, _, err_doc = self._run_cli(["doctor", "--format", "json"])
+        self.assertEqual(code_doc, EXIT_ENV_OR_PERM_ERROR)
+        self.assertIn("message_1.db", err_doc)
+
+    def test_14_dat_signature_tightening_wechat4_v1_v2_and_hd_media_priority(self) -> None:
+        """Verify BMP/RIFF collision guards, HD non-thumbnail path priority, and WeChat 4.x V1/V2 `.dat` decryption."""
+        # 1. Fake 2-byte 'BM' collision (invalid bfSize) must NOT produce a corrupt .bmp
+        fake_bm_plain = b"BM\xff\xff\x77\x01\x12\x34\x56\x78" + b"\xaa" * 30
+        fake_bm_xor = bytes(b ^ 0x42 for b in fake_bm_plain)
+        _, ext_fake, _, key_fake = detect_and_decode_wechat_dat_image(fake_bm_xor)
+        self.assertEqual(ext_fake, ".dat")
+        self.assertIsNone(key_fake)
+
+        # Valid BMP (exact bfSize + zero reserved bytes) must decode cleanly
+        valid_bmp = b"BM" + struct.pack("<I", 26) + b"\x00\x00\x00\x00" + struct.pack("<I", 14) + b"\x00" * 12
+        bmp_dec, bmp_ext, bmp_mime, bmp_k = detect_and_decode_wechat_dat_image(bytes(b ^ 0x42 for b in valid_bmp))
+        self.assertEqual((bmp_ext, bmp_mime, bmp_k), (".bmp", "image/bmp", 0x42))
+        self.assertEqual(bmp_dec, valid_bmp)
+
+        # RIFF WAVE audio must not be misidentified as WebP, while RIFF....WEBP succeeds
+        fake_riff_wav = bytes(b ^ 0x11 for b in (b"RIFF\x10\x00\x00\x00WAVEfmt " + b"\x00" * 8))
+        self.assertEqual(detect_and_decode_wechat_dat_image(fake_riff_wav)[1], ".dat")
+        valid_webp = b"RIFF\x10\x00\x00\x00WEBPVP8 " + b"\x00" * 8
+        self.assertEqual(detect_and_decode_wechat_dat_image(bytes(b ^ 0x11 for b in valid_webp))[1], ".webp")
+
+        # 2. Protobuf media path extraction must prefer original/HD path over `*_t.dat` thumbnail
+        dual_blob = _encode_protobuf_field_string(1, "Thumb/2026-11/pic_t.dat") + _encode_protobuf_field_string(
+            2, "Image/2026-11/pic.dat"
+        )
+        self.assertEqual(extract_media_path_from_blob(dual_blob), "Image/2026-11/pic.dat")
+
+        # 3. WeChat 4.x V1 (default key) and V2 (custom 16B AES key) `.dat` support
+        raw_jpeg = (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            + b"\x11\x22\x33\x44" * 10
+            + b"\xff\xd9"
+        )
+        v1_dat = encode_wechat4_dat_image(raw_jpeg, version=1)
+        dec_v1, ext_v1, _, _ = detect_and_decode_wechat_dat_image(v1_dat)
+        self.assertEqual(ext_v1, ".jpg")
+        self.assertEqual(dec_v1, raw_jpeg)
+
+        custom_aes = b"MyCustom16ByteK!"
+        v2_dat = encode_wechat4_dat_image(raw_jpeg, aes_key=custom_aes, version=2)
+        _, ext_locked, mime_locked, _ = detect_and_decode_wechat_dat_image(v2_dat)
+        self.assertEqual((ext_locked, mime_locked), (".dat", WECHAT4_DAT_MIME_LOCKED))
+
+        (self.media_dir / "v2_hd.dat").write_bytes(v2_dat)
+        plain_msg0 = self.tmp_dir / "plain_message_0.db"
+        tbl_work = f"Msg_{_md5('10001@chatroom')}"
+        m_conn = sqlite3.connect(str(plain_msg0))
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                11,
+                90011,
+                3,
+                self.now_ts - 100,
+                1,
+                0,
+                '<msg><img hdlength="60" length="60" /></msg>',
+                None,
+                _encode_protobuf_field_string(2, "attach/v2_hd.dat"),
+            ),
+        )
+        m_conn.commit()
+        m_conn.close()
+        encrypt_sqlite_to_sqlcipher(plain_msg0, self.msg_dir / "message_0.db", self.key_msg0, cipher_version=4)
+
+        _, out_f, _ = self._run_cli(["fetch", "--fresh", "--chats", "10001@chatroom", "--since", "24h", "--format", "json"])
+        v2_msg_id = json.loads(out_f)["chats"][0]["messages"][-1]["msg_id"]
+
+        # Without `--dat-key`, V2 export fails closed with actionable Exit Code 2 instead of writing corrupt image
+        code_nokey, _, err_nokey = self._run_cli(["export-media", "--msg-ids", str(v2_msg_id), "--format", "json"])
+        self.assertEqual(code_nokey, EXIT_ENV_OR_PERM_ERROR)
+        self.assertEqual(json.loads(err_nokey)["error_code"], "WECHAT4_V2_DAT_KEY_REQUIRED")
+
+        # Configure `--dat-key` and verify clean `.jpg` export
+        code_k, _, err_k = self._run_cli(["key", "--dat-key", custom_aes.decode("ascii"), "--format", "json"])
+        self.assertEqual(code_k, EXIT_SUCCESS, err_k)
+        code_ok, out_ok, err_ok = self._run_cli(["export-media", "--msg-ids", str(v2_msg_id), "--format", "json"])
+        self.assertEqual(code_ok, EXIT_SUCCESS, err_ok)
+        exp_item = json.loads(out_ok)["exported"][0]
+        self.assertEqual(exp_item["mime_type"], "image/jpeg")
+        self.assertEqual(Path(exp_item["exported_path"]).read_bytes(), raw_jpeg)
+
+    def test_15_recorditem_forwarded_history_voicetrans_ms_timestamp_and_fts5_search(self) -> None:
+        """Verify `<recorditem>` merged history, `<voicetrans>`, ms epoch normalization, and 2-char/4-char fast search."""
+        merged_xml = (
+            "<msg><appmsg><title>架构评审群的聊天记录</title><type>19</type>"
+            "<recorditem><![CDATA[<recordinfo><datalist>"
+            "<dataitem><sourcename>林架构</sourcename><datadesc>分布式事务补偿方案定稿</datadesc></dataitem>"
+            "<dataitem><sourcename>赵测试</sourcename><datadesc>压测吞吐达标</datadesc></dataitem>"
+            "</datalist></recordinfo>]]></recorditem></appmsg></msg>"
+        )
+        voicetrans_xml = (
+            '<msg><voicemsg endflag="1" length="4096" voicelength="8000" />'
+            '<voicetrans transtext="明早九点准时召开灰度复盘会" /></msg>'
+        )
+
+        plain_msg0 = self.tmp_dir / "plain_message_0.db"
+        tbl_work = f"Msg_{_md5('10001@chatroom')}"
+        m_conn = sqlite3.connect(str(plain_msg0))
+        # Use millisecond create_time (`* 1000`) to verify ingestion-time second normalization
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (11, 90011, 49, (self.now_ts - 120) * 1000, 1, 0, merged_xml, None, None),
+        )
+        m_conn.execute(
+            f"INSERT INTO {tbl_work} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (12, 90012, 34, (self.now_ts - 110) * 1000, 2, 0, voicetrans_xml, None, None),
+        )
+        m_conn.commit()
+        m_conn.close()
+        encrypt_sqlite_to_sqlcipher(plain_msg0, self.msg_dir / "message_0.db", self.key_msg0, cipher_version=4)
+
+        code_f, out_f, err_f = self._run_cli(
+            ["fetch", "--fresh", "--chats", "10001@chatroom", "--since", "24h", "--format", "json"]
+        )
+        self.assertEqual(code_f, EXIT_SUCCESS, err_f)
+        msgs = json.loads(out_f)["chats"][0]["messages"]
+        texts_joined = "\n".join(m["text"] for m in msgs)
+        self.assertIn("林架构: 分布式事务补偿方案定稿", texts_joined)
+        self.assertIn("赵测试: 压测吞吐达标", texts_joined)
+        self.assertIn("[语音转文字] 明早九点准时召开灰度复盘会", texts_joined)
+
+        # 2-char Chinese query (hits SQLite `instr(search_text, ?)`)
+        c2, out2, _ = self._run_cli(["search", "--query", "压测", "--format", "json"])
+        self.assertEqual(c2, EXIT_SUCCESS)
+        self.assertEqual(json.loads(out2)["meta"]["match_count"], 1)
+
+        # 4-char Chinese query (hits FTS5 trigram index `wx_messages_fts`)
+        c4, out4, _ = self._run_cli(["search", "--query", "灰度复盘", "--format", "json"])
+        self.assertEqual(c4, EXIT_SUCCESS)
+        self.assertEqual(json.loads(out4)["meta"]["match_count"], 1)
+
+    def test_16_mcp_hardening_annotations_and_windows_compat_helpers(self) -> None:
+        """Verify MCP `readOnlyHint` annotations, batch/non-dict JSON-RPC resilience, and Windows path/URI helpers."""
+        mcp_reqs = "\n".join(
+            [
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                json.dumps([{"jsonrpc": "2.0", "id": 2, "method": "ping"}]),
+                json.dumps([]),
+                json.dumps(12345),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": "unknown_tool_xyz", "arguments": {}},
+                    }
+                ),
+            ]
+        ) + "\n"
+
+        # Point config to a non-existent wx_data_dir to prove unknown tool validation happens BEFORE ensure_snapshot()
+        bad_cfg_path = self.tmp_dir / "bad_cfg.json"
+        bad_cfg = AppConfig(wx_data_dir=str(self.tmp_dir / "missing_wx"), snapshot_dir=str(self.snapshot_dir))
+        bad_cfg.save(bad_cfg_path)
+
+        in_buf = io.StringIO(mcp_reqs)
+        out_buf = io.StringIO()
+        with patch("sys.stdin", in_buf), patch("sys.stdout", out_buf):
+            rc = main(["mcp-serve", "--config", str(bad_cfg_path)])
+        self.assertEqual(rc, 0)
+        resps = [json.loads(line) for line in out_buf.getvalue().strip().splitlines()]
+        self.assertEqual(len(resps), 5)
+
+        tools = resps[0]["result"]["tools"]
+        self.assertEqual(len(tools), 4)
+        for t in tools:
+            self.assertTrue(t["annotations"]["readOnlyHint"])
+            self.assertFalse(t["annotations"]["destructiveHint"])
+        by_name = {t["name"]: t for t in tools}
+        self.assertIn("fresh", by_name["wechat_search_messages"]["inputSchema"]["properties"])
+        self.assertIn("fresh", by_name["wechat_export_media"]["inputSchema"]["properties"])
+
+        # Batch array response
+        self.assertIsInstance(resps[1], list)
+        self.assertEqual(resps[1][0]["id"], 2)
+        # Empty array and scalar must return -32600 Invalid Request without crashing stdio loop
+        self.assertEqual(resps[2]["error"]["code"], -32600)
+        self.assertEqual(resps[3]["error"]["code"], -32600)
+        # Unknown tool must return MCP tool error directly without failing on missing WeChat directory
+        self.assertTrue(resps[4]["result"]["isError"])
+        self.assertIn("Unknown tool: unknown_tool_xyz", resps[4]["result"]["content"][0]["text"])
+
+        # Windows & epoch helper unit checks
+        self.assertEqual(normalize_epoch_sec(1700000000999), 1700000000)
+        ro_uri = make_ro_sqlite_uri(self.config_path)
+        self.assertTrue(ro_uri.startswith("file://"))
+        self.assertTrue(ro_uri.endswith("?mode=ro"))
+        with patch.object(sys, "platform", "win32"), patch.dict(
+            os.environ, {"LOCALAPPDATA": "/tmp/mock_win_localappdata"}, clear=False
+        ):
+            win_dir = _resolve_default_app_support_dir()
+            self.assertEqual(win_dir.name, "WeChat-LocalMind")
 
 
 if __name__ == "__main__":

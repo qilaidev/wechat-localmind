@@ -1,6 +1,7 @@
 """Constants, exit codes, default paths, and WeChat 3.x / 4.x message type mappings."""
 
 import os
+import sys
 from pathlib import Path
 
 # POSIX Exit Codes
@@ -33,9 +34,27 @@ CANDIDATE_WECHAT_ROOTS = (
     "~/xwechat_files",
 )
 
-DEFAULT_APP_SUPPORT_DIR = Path(
-    os.path.expanduser("~/Library/Application Support/WeChat-LocalMind")
-)
+
+def _resolve_default_app_support_dir() -> Path:
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            return Path(local_appdata) / "WeChat-LocalMind"
+        return Path(os.path.expanduser("~/AppData/Local")) / "WeChat-LocalMind"
+    return Path(os.path.expanduser("~/Library/Application Support/WeChat-LocalMind"))
+
+
+def _resolve_default_wx_data_dir() -> Path:
+    if sys.platform == "win32":
+        win_xwechat = Path(os.path.expanduser("~/Documents/xwechat_files"))
+        if win_xwechat.exists():
+            return win_xwechat
+        return Path(os.path.expanduser("~/Documents/WeChat Files"))
+    return DEFAULT_MAC_WECHAT4_FILES_DIR
+
+
+DEFAULT_APP_SUPPORT_DIR = _resolve_default_app_support_dir()
+DEFAULT_WX_DATA_DIR = _resolve_default_wx_data_dir()
 DEFAULT_CONFIG_PATH = DEFAULT_APP_SUPPORT_DIR / "config.json"
 DEFAULT_KEYS_PATH = DEFAULT_APP_SUPPORT_DIR / "keys.json"
 DEFAULT_SNAPSHOT_DIR = DEFAULT_APP_SUPPORT_DIR / "snapshot"
@@ -108,15 +127,23 @@ MEDIA_MSG_TYPES = frozenset({
     "sticker",
 })
 
+# WeChat 4.x (.dat v4) AES-128-ECB + XOR hybrid encrypted image headers
+WECHAT4_DAT_V1_MAGIC = b"\x07\x08V1\x08\x07"
+WECHAT4_DAT_V2_MAGIC = b"\x07\x08V2\x08\x07"
+WECHAT4_DAT_V1_DEFAULT_AES_KEY = b"cfcd208495d565ef"
+
 # Image .dat XOR magic header candidates: (magic_bytes, extension, mime_type)
 DAT_IMAGE_SIGNATURES = (
     (b"\xff\xd8\xff", ".jpg", "image/jpeg"),
-    (b"\x89PNG", ".png", "image/png"),
-    (b"GIF8", ".gif", "image/gif"),
+    (b"\x89PNG\r\n\x1a\n", ".png", "image/png"),
+    (b"GIF87a", ".gif", "image/gif"),
+    (b"GIF89a", ".gif", "image/gif"),
     (b"RIFF", ".webp", "image/webp"),
     (b"BM", ".bmp", "image/bmp"),
     (b"\x00\x00\x00\x18ftyp", ".heic", "image/heic"),
+    (b"\x00\x00\x00\x1cftyp", ".heic", "image/heic"),
     (b"\x00\x00\x00\x20ftyp", ".heic", "image/heic"),
+    (b"\x00\x00\x00\x24ftyp", ".heic", "image/heic"),
 )
 
 # Default cleaning parameters

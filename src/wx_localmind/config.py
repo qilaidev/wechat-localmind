@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from .constants import (
+    DEFAULT_APP_SUPPORT_DIR,
     DEFAULT_CONFIG_PATH,
     DEFAULT_CONTEXT_BUFFER_COUNT,
     DEFAULT_KEYS_PATH,
     DEFAULT_LONG_AUDIO_THRESHOLD_SEC,
-    DEFAULT_MAC_WECHAT4_FILES_DIR,
     DEFAULT_SNAPSHOT_DIR,
     DEFAULT_SNAPSHOT_TTL_SEC,
+    DEFAULT_WX_DATA_DIR,
 )
 from .errors import PolicyDeniedError, UsageError
 
@@ -43,10 +44,11 @@ class AppConfig:
     whitelist_chats: list[str] = field(default_factory=list)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     cleaning: CleaningConfig = field(default_factory=CleaningConfig)
-    wx_data_dir: str = str(DEFAULT_MAC_WECHAT4_FILES_DIR)
+    wx_data_dir: str = str(DEFAULT_WX_DATA_DIR)
     account_dir: str = ""  # Optional explicit account dir (e.g. wxid_xxx_e948)
     raw_key_hex: str = ""  # Global or default 64-hex SQLCipher key
     db_keys: dict[str, str] = field(default_factory=dict)  # Per-db or salt->key mapping
+    dat_aes_key: str = ""  # Optional 16-byte ASCII or 32-hex AES key for WeChat 4.x V1/V2 .dat images
     keys_file: str = str(DEFAULT_KEYS_PATH)
     snapshot_dir: str = str(DEFAULT_SNAPSHOT_DIR)
 
@@ -68,6 +70,10 @@ class AppConfig:
         env_raw_key = (
             os.environ.get("WECHAT_LOCALMIND_KEY")
             or os.environ.get("WX_LOCALMIND_KEY")
+        )
+        env_dat_key = (
+            os.environ.get("WECHAT_LOCALMIND_DAT_KEY")
+            or os.environ.get("WX_LOCALMIND_DAT_KEY")
         )
 
         if not path.exists():
@@ -100,10 +106,11 @@ class AppConfig:
                     fold_noise_markdown=bool(cleaning_raw.get("fold_noise_markdown", True)),
                     fold_noise_json=bool(cleaning_raw.get("fold_noise_json", False)),
                 ),
-                wx_data_dir=raw.get("wx_data_dir", str(DEFAULT_MAC_WECHAT4_FILES_DIR)),
+                wx_data_dir=raw.get("wx_data_dir", str(DEFAULT_WX_DATA_DIR)),
                 account_dir=raw.get("account_dir", ""),
                 raw_key_hex=raw.get("raw_key_hex", ""),
                 db_keys=dict(raw.get("db_keys", {})),
+                dat_aes_key=str(raw.get("dat_aes_key", "")).strip(),
                 keys_file=raw.get("keys_file", str(DEFAULT_KEYS_PATH)),
                 snapshot_dir=raw.get("snapshot_dir", str(DEFAULT_SNAPSHOT_DIR)),
             )
@@ -116,6 +123,8 @@ class AppConfig:
             cfg.snapshot_dir = env_snapshot_dir
         if env_raw_key:
             cfg.raw_key_hex = env_raw_key.strip()
+        if env_dat_key:
+            cfg.dat_aes_key = env_dat_key.strip()
 
         # Also merge keys from keys_file if it exists
         keys_path = Path(os.path.expanduser(cfg.keys_file))
@@ -137,13 +146,27 @@ class AppConfig:
 
     def save(self, config_path: Path | None = None) -> Path:
         path = config_path or DEFAULT_CONFIG_PATH
-        path.parent.mkdir(parents=True, exist_ok=True)
+        parent_existed = path.parent.exists()
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not parent_existed or path.parent == DEFAULT_APP_SUPPORT_DIR:
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
         tmp_path = path.with_suffix(".json.tmp")
         tmp_path.write_text(
             json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
         tmp_path.replace(path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return path
 
     def to_dict(self) -> dict[str, Any]:

@@ -34,6 +34,9 @@ wechat-localmind key --import ./keys.json
 # 扫描内存转储或 LLDB 日志文件，自动通过各分片库 16字节 Salt + HMAC 匹配提取密钥
 wechat-localmind key --scan-dump ./wechat_memory.dump
 
+# （可选）配置 WeChat 4.x V2 加密高清 .dat 图片的 16字节 ASCII 或 32位 Hex AES 密钥
+wechat-localmind key --dat-key "<16-byte-ascii-or-32-hex>"
+
 # 手动触发全分片离线解密并生成统一只读快照
 wechat-localmind decrypt
 ```

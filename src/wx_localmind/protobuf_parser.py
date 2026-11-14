@@ -1,9 +1,12 @@
-"""WeChat message decompression (zstd / lz4), XML <msg>/<appmsg> parser, and Protobuf wire parser."""
+"""WeChat message decompression (zstd), XML <msg>/<appmsg> parser, and Protobuf wire parser."""
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import os
 import re
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -12,8 +15,13 @@ from typing import Any
 from .constants import APPMSG_SUBTYPE_MAP
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+MAX_ZSTD_OUTPUT_BYTES = 16 * 1024 * 1024
 SENDER_PREFIX_RE = re.compile(r"^([A-Za-z0-9_\-@.\u4e00-\u9fff]{2,48}):\n(.*)$", re.DOTALL)
 XML_TAG_RE = re.compile(r"<(msg|appmsg|sysmsg|voicemsg|img|videomsg)\b", re.IGNORECASE)
+THUMB_PATH_RE = re.compile(r"(?:_t\.(?:dat|jpg|jpeg|png|webp)$|_thumb\.(?:dat|jpg|jpeg|png)$|/(?:image)?thumb/)", re.IGNORECASE)
+
+_CACHED_CTYPES_ZSTD: tuple[Any, Any, Any, Any, Any] | bool | None = None
+_CACHED_ZSTD_CLI: str | bool | None = None
 
 
 @dataclass
@@ -37,6 +45,162 @@ class ParsedWeChatPayload:
     is_pat_message: bool = False
 
 
+def _get_ctypes_libzstd() -> tuple[Any, Any, Any, Any, Any] | None:
+    """Load and cache native `libzstd` shared library once across macOS, Linux, and Windows."""
+    global _CACHED_CTYPES_ZSTD
+    if _CACHED_CTYPES_ZSTD is False:
+        return None
+    if isinstance(_CACHED_CTYPES_ZSTD, tuple):
+        return _CACHED_CTYPES_ZSTD
+
+    candidates: list[str] = []
+    found_sys = ctypes.util.find_library("zstd")
+    if found_sys:
+        candidates.append(found_sys)
+    candidates.extend(
+        [
+            "/opt/homebrew/lib/libzstd.dylib",
+            "/usr/local/lib/libzstd.dylib",
+            "/opt/local/lib/libzstd.dylib",
+            "libzstd.so.1",
+            "/usr/lib/x86_64-linux-gnu/libzstd.so.1",
+            "/usr/lib/aarch64-linux-gnu/libzstd.so.1",
+            "/usr/lib64/libzstd.so.1",
+            "libzstd.dll",
+            "zstd.dll",
+        ]
+    )
+
+    for lib_name in candidates:
+        try:
+            if lib_name.startswith("/") and not os.path.exists(lib_name):
+                continue
+            lib = ctypes.CDLL(lib_name)
+            get_size = lib.ZSTD_getFrameContentSize
+            get_size.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            get_size.restype = ctypes.c_ulonglong
+
+            dec_fn = lib.ZSTD_decompress
+            dec_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+            dec_fn.restype = ctypes.c_size_t
+
+            is_err = lib.ZSTD_isError
+            is_err.argtypes = [ctypes.c_size_t]
+            is_err.restype = ctypes.c_uint
+
+            comp_fn = getattr(lib, "ZSTD_compress", None)
+            if comp_fn is not None:
+                comp_fn.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_void_p,
+                    ctypes.c_size_t,
+                    ctypes.c_int,
+                ]
+                comp_fn.restype = ctypes.c_size_t
+
+            _CACHED_CTYPES_ZSTD = (lib, get_size, dec_fn, comp_fn, is_err)
+            return _CACHED_CTYPES_ZSTD
+        except Exception:
+            continue
+
+    _CACHED_CTYPES_ZSTD = False
+    return None
+
+
+def _get_zstd_cli_path() -> str | None:
+    """Resolve and cache system `zstd` CLI path once to avoid per-message FileNotFoundError overhead."""
+    global _CACHED_ZSTD_CLI
+    if _CACHED_ZSTD_CLI is False:
+        return None
+    if isinstance(_CACHED_ZSTD_CLI, str):
+        return _CACHED_ZSTD_CLI
+    found = shutil.which("zstd")
+    _CACHED_ZSTD_CLI = found if found else False
+    return found
+
+
+def get_zstd_backend_name() -> str | None:
+    """Return active Zstandard decompression backend identifier for `doctor` diagnostics."""
+    try:
+        import compression.zstd as _std_zstd  # type: ignore  # noqa: F401
+
+        return "stdlib_compression_zstd"
+    except Exception:
+        pass
+
+    try:
+        import zstandard as _zstd  # type: ignore  # noqa: F401
+
+        return "python_zstandard"
+    except Exception:
+        pass
+
+    try:
+        import pyzstd as _pyzstd  # type: ignore  # noqa: F401
+
+        return "python_pyzstd"
+    except Exception:
+        pass
+
+    if _get_ctypes_libzstd() is not None:
+        return "ctypes_libzstd"
+
+    if _get_zstd_cli_path() is not None:
+        return "cli_zstd"
+
+    return None
+
+
+def compress_zstd_bytes(data: bytes) -> bytes | None:
+    """Compress bytes into Zstandard frame using available native/C backend (used in tests & diagnostics)."""
+    try:
+        import compression.zstd as std_zstd  # type: ignore
+
+        return std_zstd.compress(data)
+    except Exception:
+        pass
+
+    try:
+        import zstandard as zstd  # type: ignore
+
+        return zstd.ZstdCompressor().compress(data)
+    except Exception:
+        pass
+
+    try:
+        import pyzstd  # type: ignore
+
+        return pyzstd.compress(data)
+    except Exception:
+        pass
+
+    ct_zstd = _get_ctypes_libzstd()
+    if ct_zstd is not None and ct_zstd[3] is not None:
+        _lib, _get_size, _dec_fn, comp_fn, is_err = ct_zstd
+        cap = len(data) + (len(data) >> 7) + 512
+        out_buf = ctypes.create_string_buffer(cap)
+        res = comp_fn(out_buf, cap, data, len(data), 3)
+        if not is_err(res) and res <= cap:
+            return out_buf.raw[:res]
+
+    zstd_bin = _get_zstd_cli_path()
+    if zstd_bin:
+        try:
+            proc = subprocess.run(
+                [zstd_bin, "-q", "-c"],
+                input=data,
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+        except Exception:
+            pass
+    return None
+
+
 def decompress_zstd_or_raw(blob: bytes | str | None) -> str:
     """Decompress WeChat 4.x zstd-compressed `compress_content` or decode raw UTF-8/UTF-16 text."""
     if blob is None:
@@ -50,8 +214,10 @@ def decompress_zstd_or_raw(blob: bytes | str | None) -> str:
     # Check Zstandard magic number (0xFD2FB528 in little-endian -> 28 B5 2F FD)
     if data.startswith(ZSTD_MAGIC):
         decompressed = _decompress_zstd_bytes(data)
-        if decompressed:
-            data = decompressed
+        if decompressed is None:
+            # Never decode compressed binary ZSTD bytes as UTF-16LE/GB18030 mojibake
+            return ""
+        data = decompressed
 
     # Strip trailing null bytes
     data = data.rstrip(b"\x00")
@@ -74,50 +240,59 @@ def _decompress_zstd_bytes(data: bytes) -> bytes | None:
     except Exception:
         pass
 
-    # 2. Optional third-party `zstandard` C-extension
+    # 2. Optional third-party `zstandard` or `pyzstd` C-extension
     try:
         import zstandard as zstd  # type: ignore
 
         dctx = zstd.ZstdDecompressor()
-        return dctx.decompress(data, max_output_size=10 * 1024 * 1024)
+        return dctx.decompress(data, max_output_size=MAX_ZSTD_OUTPUT_BYTES)
     except Exception:
         pass
 
-    # 3. Native `libzstd.dylib` via ctypes on macOS
     try:
-        import ctypes
+        import pyzstd  # type: ignore
 
-        for lib_path in ("/opt/homebrew/lib/libzstd.dylib", "/usr/local/lib/libzstd.dylib"):
-            if os.path.exists(lib_path):
-                lib = ctypes.CDLL(lib_path)
-                get_size = lib.ZSTD_getFrameContentSize
-                get_size.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                get_size.restype = ctypes.c_ulonglong
-                frame_sz = get_size(data, len(data))
-                out_cap = int(frame_sz) if (0 < frame_sz < 10 * 1024 * 1024) else 512 * 1024
+        return pyzstd.decompress(data)
+    except Exception:
+        pass
+
+    # 3. Cached `libzstd` shared library via ctypes across macOS / Linux / Windows
+    ct_zstd = _get_ctypes_libzstd()
+    if ct_zstd is not None:
+        try:
+            _lib, get_size, dec_fn, _comp_fn, is_err = ct_zstd
+            frame_sz = int(get_size(data, len(data)))
+            # ZSTD_CONTENTSIZE_UNKNOWN == (unsigned long long)-1, ZSTD_CONTENTSIZE_ERROR == -2
+            if 0 < frame_sz <= MAX_ZSTD_OUTPUT_BYTES:
+                caps = [frame_sz]
+            elif frame_sz == 0:
+                return b""
+            else:
+                caps = [512 * 1024, 4 * 1024 * 1024, MAX_ZSTD_OUTPUT_BYTES]
+
+            for out_cap in caps:
                 out_buf = ctypes.create_string_buffer(out_cap)
-                dec_fn = lib.ZSTD_decompress
-                dec_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-                dec_fn.restype = ctypes.c_size_t
-                res_sz = dec_fn(out_buf, out_cap, data, len(data))
-                if 0 < res_sz <= out_cap:
+                res_sz = int(dec_fn(out_buf, out_cap, data, len(data)))
+                if not is_err(res_sz) and res_sz <= out_cap:
                     return out_buf.raw[:res_sz]
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # 4. Fallback to system `zstd -d -q -c` binary
-    try:
-        proc = subprocess.run(
-            ["zstd", "-d", "-q", "-c"],
-            input=data,
-            capture_output=True,
-            timeout=3.0,
-            check=False,
-        )
-        if proc.returncode == 0 and proc.stdout:
-            return proc.stdout
-    except Exception:
-        pass
+    # 4. Cached system `zstd -d -q -c` binary fallback
+    zstd_bin = _get_zstd_cli_path()
+    if zstd_bin:
+        try:
+            proc = subprocess.run(
+                [zstd_bin, "-d", "-q", "-c"],
+                input=data,
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout is not None:
+                return proc.stdout
+        except Exception:
+            pass
     return None
 
 
@@ -143,8 +318,9 @@ def parse_protobuf_strings(blob: bytes | None) -> dict[int, list[str]]:
     data = bytes(blob)
     if data.startswith(ZSTD_MAGIC):
         dec = _decompress_zstd_bytes(data)
-        if dec:
-            data = dec
+        if dec is None:
+            return out
+        data = dec
 
     i = 0
     n = len(data)
@@ -218,9 +394,13 @@ def parse_protobuf_strings(blob: bytes | None) -> dict[int, list[str]]:
 
 
 def extract_media_path_from_blob(blob: bytes | None) -> str | None:
-    """Find relative attachment/image/voice file path stored inside `packed_info_data` or `BytesExtra`."""
+    """Find relative attachment/image/voice file path stored inside `packed_info_data` or `BytesExtra`.
+
+    Prioritizes original / HD paths over preview thumbnails (`*_t.dat`, `*_thumb.*`, `/Thumb/`).
+    """
     fields = parse_protobuf_strings(blob)
-    path_candidates: list[str] = []
+    primary_candidates: list[str] = []
+    thumb_candidates: list[str] = []
     for vals in fields.values():
         for s in vals:
             clean = s.replace("\\", "/").strip()
@@ -231,8 +411,13 @@ def extract_media_path_from_blob(blob: bytes | None) -> str | None:
                 )
                 or clean.startswith(("msg/", "attach/", "file/", "video/", "voice/", "FileStorage/"))
             ):
-                path_candidates.append(clean)
-    return path_candidates[0] if path_candidates else None
+                if THUMB_PATH_RE.search(clean):
+                    thumb_candidates.append(clean)
+                else:
+                    primary_candidates.append(clean)
+    if primary_candidates:
+        return primary_candidates[0]
+    return thumb_candidates[0] if thumb_candidates else None
 
 
 def _extract_xml_fragment(text: str) -> str | None:
@@ -252,6 +437,38 @@ def _find_text(elem: ET.Element | None, path: str) -> str:
     if node is not None and node.text:
         return node.text.strip()
     return ""
+
+
+def _extract_recorditem_lines(recorditem_raw: str, max_items: int = 20) -> list[str]:
+    """Expand nested `<recorditem>` XML inside `<appmsg type='19'>` merged chat history."""
+    if not recorditem_raw:
+        return []
+    xml_frag = recorditem_raw.strip()
+    if not xml_frag.startswith("<"):
+        return []
+    try:
+        rec_root = ET.fromstring(xml_frag)
+    except ET.ParseError:
+        return []
+
+    lines: list[str] = []
+    data_items = rec_root.findall(".//datalist/dataitem")
+    for idx, item in enumerate(data_items):
+        if idx >= max_items:
+            remaining = len(data_items) - max_items
+            if remaining > 0:
+                lines.append(f"...(另有 {remaining} 条转发记录已省略)")
+            break
+        sender = _find_text(item, "sourcename") or "群成员"
+        desc = _find_text(item, "datadesc") or _find_text(item, "datatitle")
+        if not desc:
+            dtype = (item.attrib.get("datatype") or "").strip()
+            desc = "[图片]" if dtype == "2" else ("[文件]" if dtype == "8" else "[富媒体]")
+        single_desc = " ".join(desc.splitlines()).strip()
+        if len(single_desc) > 200:
+            single_desc = single_desc[:200] + "..."
+        lines.append(f"{sender}: {single_desc}")
+    return lines
 
 
 def parse_wechat_message_payload(
@@ -282,7 +499,6 @@ def parse_wechat_message_payload(
     # 1. Plain text message (local_type == 1)
     if local_type == 1:
         result.normalized_type = "text"
-        # Sometimes <msgsource><atuserlist> is attached or stored in packed_blob
         xml_frag = _extract_xml_fragment(body_str)
         if xml_frag and body_str.startswith("<"):
             _parse_xml_into_payload(xml_frag, local_type, result)
@@ -300,7 +516,6 @@ def parse_wechat_message_payload(
             result.is_revoked = True
             result.normalized_type = "revoked"
             return result
-        # Any other 10002 system notification without business payload is system_event noise
         result.normalized_type = "system_event"
         result.text = body_str
         return result
@@ -369,7 +584,6 @@ def _parse_xml_into_payload(xml_str: str, local_type: int, result: ParsedWeChatP
     try:
         root = ET.fromstring(xml_str)
     except ET.ParseError:
-        # Fallback regex extraction if XML contains unescaped characters
         _regex_fallback_xml(xml_str, local_type, result)
         return
 
@@ -391,6 +605,11 @@ def _parse_xml_into_payload(xml_str: str, local_type: int, result: ParsedWeChatP
                 result.media_duration_sec = max(1, round(int(vlen_ms) / 1000))
             except ValueError:
                 result.media_duration_sec = 0
+        voicetrans = root.find(".//voicetrans")
+        if voicetrans is not None:
+            trans = (voicetrans.attrib.get("transtext") or "").strip()
+            if trans:
+                result.text = f"[语音转文字] {trans}"
         return
 
     # Image message (<img hdlength="..." length="..." />)
@@ -469,7 +688,6 @@ def _parse_xml_into_payload(xml_str: str, local_type: int, result: ParsedWeChatP
                     _, clean_ref = split_group_sender_prefix(ref_content)
                     result.quoted_text_snippet = clean_ref
                 else:
-                    # Quoted parent might itself be an appmsg or media
                     sub_parsed = parse_wechat_message_payload(int(ref_type_str or 49), ref_content)
                     result.quoted_text_snippet = (
                         sub_parsed.text or sub_parsed.media_title or f"[{sub_parsed.normalized_type or '附件'}]"
@@ -506,7 +724,14 @@ def _parse_xml_into_payload(xml_str: str, local_type: int, result: ParsedWeChatP
 
         if sub_type == 19:  # Merged chat history (<recorditem>)
             result.normalized_type = "text"
-            result.text = f"[合并转发的聊天记录: {title or '聊天记录'} ({des})]" if des else f"[合并转发的聊天记录: {title}]"
+            rec_lines = _extract_recorditem_lines(_find_text(appmsg, "recorditem"))
+            header = f"[合并转发的聊天记录: {title or '聊天记录'}]"
+            if rec_lines:
+                result.text = header + "\n" + "\n".join(f"  - {ln}" for ln in rec_lines)
+            elif des:
+                result.text = f"[合并转发的聊天记录: {title or '聊天记录'} ({des})]"
+            else:
+                result.text = f"[合并转发的聊天记录: {title}]"
             return
 
         if sub_type == 87:  # Group announcement (@所有人)

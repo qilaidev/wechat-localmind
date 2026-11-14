@@ -31,7 +31,7 @@ from .formatter import (
     format_search_markdown,
 )
 from .mcp_server import run_mcp_stdio_server
-from .media import MediaExporter
+from .media import MediaExporter, parse_dat_aes_key
 from .snapshot import SnapshotManager, discover_wechat_account
 
 
@@ -127,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Scan a memory dump or LLDB log file to auto-match SQLCipher keys against local WeChat DB salts.",
+    )
+    p_key.add_argument(
+        "--dat-key",
+        dest="dat_key",
+        default=None,
+        help="Set 16-byte ASCII or 32-hex AES key for WeChat 4.x V1/V2 encrypted .dat images.",
     )
     p_key.add_argument(
         "--verify",
@@ -387,6 +393,7 @@ def _handle_doctor(args: argparse.Namespace) -> str:
             f"- 整体状态: {'🟢 正常就绪 (Healthy)' if overall_healthy else '🔴 异常'}",
             f"- 账号目录: `{src_check.get('account_dir')}` (微信号: `{src_check.get('wxid')}`, 架构: `{src_check.get('arch_version')}`)",
             f"- 消息分片库数量: `{src_check.get('message_db_count', 0)}` 个 (已验证密钥/可读: `{src_check.get('key_verified_db_count', 0)}` 个)",
+            f"- Zstandard 解压后端: `{src_check.get('zstd_backend') or '未安装'}`",
             f"- 统一快照路径: `{snapshot_status.get('snapshot_db_path')}` (构建耗时: `{snapshot_status.get('backup_duration_ms')} ms`)",
             f"- 全局最新消息游标 (`global_latest_msg_id`): `{snapshot_status.get('global_latest_msg_id')}`",
             f"- 原库最后活跃时间: `{snapshot_status.get('db_latest_msg_time')}`",
@@ -430,6 +437,15 @@ def _handle_key(args: argparse.Namespace) -> str:
                 cfg.db_keys[k] = k_str
         updated = True
 
+    if args.dat_key:
+        dk = args.dat_key.strip()
+        if parse_dat_aes_key(dk) is None:
+            raise UsageError(
+                f"Invalid WeChat 4.x .dat AES key '{dk}'. Expected 16-byte ASCII string or 32-char hex (16 bytes)."
+            )
+        cfg.dat_aes_key = dk
+        updated = True
+
     if args.scan_dump:
         dump_path = args.scan_dump.expanduser().resolve()
         if not dump_path.is_file():
@@ -445,6 +461,10 @@ def _handle_key(args: argparse.Namespace) -> str:
         matched_map = extract_keys_from_memory_dump(dump_path.read_bytes(), all_dbs)
         for db_n, hex_k in matched_map.items():
             cfg.db_keys[db_n] = hex_k
+        # If multiple DBs share one pre-PBKDF2 master key and global raw_key_hex is unset, promote it
+        unique_matched = set(matched_map.values())
+        if len(matched_map) >= 2 and len(unique_matched) == 1 and not cfg.raw_key_hex:
+            cfg.raw_key_hex = next(iter(unique_matched))
         updated = True
 
     if updated:

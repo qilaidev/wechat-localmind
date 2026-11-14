@@ -27,8 +27,9 @@ from .constants import (
     SYNC_LAG_WARNING_SEC,
 )
 from .errors import ResourceNotFoundError, UsageError
-from .protobuf_parser import parse_wechat_message_payload
-from .snapshot import SnapshotState, epoch_to_local_iso, make_ro_sqlite_uri
+from .media import resolve_safe_sandbox_path
+from .protobuf_parser import get_zstd_backend_name, parse_wechat_message_payload
+from .snapshot import SnapshotState, epoch_to_local_iso, make_ro_sqlite_uri, normalize_epoch_sec
 
 DURATION_RE = re.compile(r"^(\d+)\s*([smhdw])$", re.IGNORECASE)
 
@@ -89,6 +90,16 @@ class QueryEngine:
 
     def build_common_warnings(self) -> list[dict[str, Any]]:
         warnings: list[dict[str, Any]] = []
+        if self.snapshot.arch_version == "v4_wcdb" and get_zstd_backend_name() is None:
+            warnings.append(
+                {
+                    "code": "ZSTD_BACKEND_MISSING",
+                    "message": (
+                        "当前 Python 环境缺少 Zstandard 解压后端（Python <3.14 且未安装 zstandard / libzstd），"
+                        "WeChat 4.x 压缩富文本消息可能无法解码。"
+                    ),
+                }
+            )
         if self.snapshot.db_latest_msg_epoch is not None:
             lag_sec = int(round(time.time() - self.snapshot.db_latest_msg_epoch))
             if lag_sec > SYNC_LAG_WARNING_SEC:
@@ -190,6 +201,11 @@ class QueryEngine:
         since_24h_epoch = int(time.time() - 86400)
 
         excl_placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
+        m_ctime_expr = (
+            "(CASE WHEN m.create_time > 100000000000 THEN m.create_time / 1000 ELSE m.create_time END)"
+            if self.snapshot.arch_version == "unified_sqlite"
+            else "m.create_time"
+        )
         sql = f"""
             SELECT
                 g.chat_id,
@@ -197,15 +213,15 @@ class QueryEngine:
                 g.member_count,
                 g.last_active_epoch,
                 COALESCE(MAX(m.msg_id), 0) AS latest_msg_id,
-                MAX(m.create_time) AS latest_msg_time,
-                SUM(CASE WHEN m.create_time >= ? THEN 1 ELSE 0 END) AS msg_count_24h
+                MAX({m_ctime_expr}) AS latest_msg_time,
+                SUM(CASE WHEN {m_ctime_expr} >= ? THEN 1 ELSE 0 END) AS msg_count_24h
             FROM wx_groups g
             LEFT JOIN wx_messages m
                 ON m.chat_id = g.chat_id
                 AND m.local_type NOT IN ({excl_placeholders})
             WHERE g.chat_id LIKE '%@chatroom'
             GROUP BY g.chat_id
-            ORDER BY COALESCE(MAX(m.create_time), g.last_active_epoch, 0) DESC
+            ORDER BY COALESCE(MAX({m_ctime_expr}), g.last_active_epoch, 0) DESC
         """
         cur.execute(sql, [since_24h_epoch, *EXCLUDED_MSG_TYPES])
 
@@ -305,14 +321,16 @@ class QueryEngine:
         cur = conn.cursor()
         row = None
         if quoted_svrid:
+            # Security boundary: bind `chat_id = ?` so spoofed `<refermsg><svrid>` cannot leak
+            # messages or sender remarks across blacklisted or other group chats.
             cur.execute(
                 """
                 SELECT msg_id, sender_wxid, is_from_me, local_type, raw_content, compress_content, packed_info_data
                 FROM wx_messages
-                WHERE server_id = ?
+                WHERE chat_id = ? AND server_id = ?
                 LIMIT 1
                 """,
-                (str(quoted_svrid),),
+                (chat_id, str(quoted_svrid)),
             )
             row = cur.fetchone()
 
@@ -364,12 +382,17 @@ class QueryEngine:
     def _resolve_media_availability(self, rel_path: str | None) -> tuple[bool, Path | None, int | None]:
         if not rel_path:
             return False, None, None
-        clean_rel = rel_path.lstrip("/\\")
-        for base in (self.snapshot.media_root_dir, self.snapshot.account_dir):
-            cand = (base / clean_rel).resolve()
-            if cand.is_file() and cand.stat().st_size > 0:
-                return True, cand, cand.stat().st_size
-        return False, None, None
+        found, within_sandbox = resolve_safe_sandbox_path(
+            rel_path,
+            self.snapshot.account_dir,
+            self.snapshot.media_root_dir,
+        )
+        if not within_sandbox or found is None:
+            return False, None, None
+        try:
+            return True, found, found.stat().st_size
+        except OSError:
+            return False, None, None
 
     def _transform_message_row(
         self,
@@ -442,8 +465,7 @@ class QueryEngine:
             parsed.quoted_text_snippet,
         )
 
-        raw_ts = int(row["create_time"] or 0)
-        msg_epoch = int(raw_ts // 1000) if raw_ts > 1e11 else raw_ts
+        msg_epoch = normalize_epoch_sec(row["create_time"])
 
         ack_noise = is_short_ack_noise(
             cleaned_text,
@@ -539,14 +561,19 @@ class QueryEngine:
             ]
             params: list[Any] = [chat_id, *EXCLUDED_MSG_TYPES]
 
+            ctime_col = (
+                "(CASE WHEN create_time > 100000000000 THEN create_time / 1000 ELSE create_time END)"
+                if self.snapshot.arch_version == "unified_sqlite"
+                else "create_time"
+            )
             if effective_after_id is not None:
                 where_clauses.append("msg_id > ?")
                 params.append(effective_after_id)
             if since_epoch is not None:
-                where_clauses.append("create_time >= ?")
+                where_clauses.append(f"{ctime_col} >= ?")
                 params.append(int(since_epoch))
             if until_epoch is not None:
-                where_clauses.append("create_time <= ?")
+                where_clauses.append(f"{ctime_col} <= ?")
                 params.append(int(until_epoch))
 
             order_dir = "ASC" if effective_after_id is not None else "DESC"
@@ -674,33 +701,85 @@ class QueryEngine:
         grp_placeholders = ",".join("?" for _ in grp_map)
         excl_placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
 
+        ctime_col = (
+            "(CASE WHEN create_time > 100000000000 THEN create_time / 1000 ELSE create_time END)"
+            if self.snapshot.arch_version == "unified_sqlite"
+            else "create_time"
+        )
         where_clauses = [
             f"chat_id IN ({grp_placeholders})",
             f"local_type NOT IN ({excl_placeholders})",
         ]
         params: list[Any] = [*grp_map.keys(), *EXCLUDED_MSG_TYPES]
         if since_epoch is not None:
-            where_clauses.append("create_time >= ?")
+            where_clauses.append(f"{ctime_col} >= ?")
             params.append(int(since_epoch))
 
         conn = self._get_conn()
         cur = conn.cursor()
-        sql = f"""
-            SELECT
-                msg_id, server_id, chat_id, sender_wxid, is_from_me,
-                local_type, create_time, raw_content, compress_content, packed_info_data
-            FROM wx_messages
-            WHERE {" AND ".join(where_clauses)}
-            ORDER BY msg_id DESC
-        """
-        cur.execute(sql, params)
 
         q_lower = q_clean.lower()
         max_hits = max(1, min(int(limit), 500))
         ctx_n = max(0, int(context_window))
+
+        cur.execute("PRAGMA table_info(wx_messages)")
+        msg_cols = {r[1] for r in cur.fetchall()}
+        has_search_text = "search_text" in msg_cols
+
+        has_fts = False
+        if has_search_text and len(q_lower) >= 3:
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wx_messages_fts'")
+            has_fts = cur.fetchone() is not None
+
+        candidate_rows: list[sqlite3.Row] | None = None
+        if has_fts:
+            escaped_phrase = q_lower.replace('"', '""')
+            fts_sql = f"""
+                SELECT
+                    msg_id, server_id, chat_id, sender_wxid, is_from_me,
+                    local_type, create_time, raw_content, compress_content, packed_info_data
+                FROM wx_messages
+                WHERE msg_id IN (SELECT rowid FROM wx_messages_fts WHERE wx_messages_fts MATCH ?)
+                  AND {" AND ".join(where_clauses)}
+                ORDER BY msg_id DESC
+                LIMIT ?
+            """
+            try:
+                cur.execute(fts_sql, [f'"{escaped_phrase}"', *params, max_hits * 4])
+                candidate_rows = cur.fetchall()
+            except sqlite3.OperationalError:
+                candidate_rows = None
+
+        if candidate_rows is None and has_search_text:
+            instr_sql = f"""
+                SELECT
+                    msg_id, server_id, chat_id, sender_wxid, is_from_me,
+                    local_type, create_time, raw_content, compress_content, packed_info_data
+                FROM wx_messages
+                WHERE search_text IS NOT NULL
+                  AND instr(search_text, ?) > 0
+                  AND {" AND ".join(where_clauses)}
+                ORDER BY msg_id DESC
+                LIMIT ?
+            """
+            cur.execute(instr_sql, [q_lower, *params, max_hits * 4])
+            candidate_rows = cur.fetchall()
+
+        if candidate_rows is None:
+            sql = f"""
+                SELECT
+                    msg_id, server_id, chat_id, sender_wxid, is_from_me,
+                    local_type, create_time, raw_content, compress_content, packed_info_data
+                FROM wx_messages
+                WHERE {" AND ".join(where_clauses)}
+                ORDER BY msg_id DESC
+            """
+            cur.execute(sql, params)
+            candidate_rows = cur.fetchall()
+
         matches: list[dict[str, Any]] = []
 
-        for row in cur.fetchall():
+        for row in candidate_rows:
             msg_obj = self._transform_message_row(row, is_context_buffer=False)
             if msg_obj is None:
                 continue

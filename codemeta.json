@@ -6,11 +6,12 @@
     "wechat-localmind",
     "wx_localmind",
     "WeChat LocalMind CLI & MCP Server",
-    "微信本地群聊提取器"
+    "微信本地聊天提取器"
   ],
-  "description": "Zero-dependency on macOS, strictly read-only local WeChat 3.x and 4.x (WCDB) group chat (@chatroom) extractor, structured cleaner, CLI, and JSON-RPC 2.0 MCP Stdio Server for AI Agents. Decrypts SQLCipher 3/4 shards in an isolated offline snapshot, physically blocks 1-on-1 private chats (wxid_*) and official accounts (gh_*), auto-decodes .dat XOR images, and makes zero outbound network calls.",
-  "version": "1.0.0",
+  "description": "Zero-dependency on macOS, strictly read-only full-account local WeChat 3.x and 4.x (WCDB) chat extractor (1-on-1 DMs, groups, official accounts), structured cleaner, CLI, and JSON-RPC 2.0 MCP Stdio Server for AI Agents. Decrypts SQLCipher 3/4 shards and .db-wal logs into an incremental offline snapshot, enforces configurable chat_scope and allow/block policies, auto-decodes 3.x XOR and 4.x V1/V2 .dat images, and makes zero outbound network calls.",
+  "version": "2.0.0",
   "datePublished": "2026-11-13",
+  "dateModified": "2026-11-18",
   "codeRepository": "https://github.com/qilaidev/wechat-localmind",
   "issueTracker": "https://github.com/qilaidev/wechat-localmind/issues",
   "url": "https://qilaidav.com/oash/",
@@ -55,26 +56,28 @@
     "python",
     "zstd",
     "wcdb",
+    "fts5",
     "dat-image-decoder",
-    "微信群聊提取",
+    "微信聊天提取",
     "微信本地数据库解密",
     "微信聊天记录导出",
     "微信MCP服务器"
   ],
   "featureList": [
-    "SQLCipher 3 (reserve=48) and SQLCipher 4 / WeChat 4.x WCDB (reserve=80) offline decryption using macOS CommonCrypto or cryptography/PyCryptodome",
+    "Full-account local WeChat chat extraction covering 1-on-1 DMs (wxid_*, custom aliases, @openim, filehelper), group chats (@chatroom, @im.chatroom), and official accounts (gh_*, notifymessage, weixin)",
+    "SQLCipher 3 (reserve=48) and SQLCipher 4 / WeChat 4.x WCDB (reserve=80) offline decryption with .db-wal frame replay using macOS CommonCrypto or cryptography/PyCryptodome",
     "WeChat 4.x zstd in-memory decompression via Python 3.14 compression.zstd, libzstd.dylib, or zstd CLI",
-    "Multi-shard aggregation across message_0.db..message_N.db and MSG*.db with globally monotonic msg_id cursors",
-    "Triple-layer @chatroom physical isolation blocking 1-on-1 wxid_* DMs and gh_* official accounts (EXIT_POLICY_DENIED = 3)",
-    "4-tier real-name resolution (remark > group_nickname > nick_name > masked wxid) and @wxid_ mention normalization",
-    "XML and Protobuf wire parsing for 150-character <refermsg> quote chains, rich appmsg subtypes, revoked message stripping, and reversible ack folding",
-    "Adaptive magic-header XOR decryption for WeChat .dat images into .jpg, .png, .gif, .webp, .bmp, and .heic",
-    "11 CLI subcommands (+ list-groups alias), 4 read-only JSON-RPC 2.0 MCP Stdio tools, and SKILL.md agent bundle"
+    "Persistent incremental snapshot watermarks across message_0.db..message_N.db and MSG*.db with globally monotonic msg_id cursors and FTS5 trigram search",
+    "Configurable chat_scope (all, groups, direct, official) and blacklist/whitelist policy enforcement (EXIT_POLICY_DENIED = 3)",
+    "4-tier real-name resolution (remark > group_nickname > nick_name > anonymized wxid/gh/contact ID) and @wxid_ mention normalization",
+    "XML and Protobuf wire parsing for 150-character <refermsg> quote chains, <recorditem> merged forwards, <voicetrans> transcripts, rich appmsg subtypes, revoked message stripping, and reversible ack folding",
+    "Adaptive magic-header XOR and WeChat 4.x V1/V2 AES-128-ECB+XOR decryption for WeChat .dat images into .jpg, .png, .gif, .webp, .bmp, and .heic",
+    "12 CLI subcommands (with list-chats and list-groups aliases), 5 read-only JSON-RPC 2.0 MCP Stdio tools (readOnlyHint: true), and SKILL.md agent bundle"
   ],
   "softwareRequirements": [
     "Python >= 3.10",
     "Zero third-party pip packages on macOS (uses built-in CommonCrypto and stdlib)",
-    "Optional cryptography or PyCryptodome on Linux/non-macOS for AES-256-CBC"
+    "Optional cryptography or PyCryptodome on Linux/non-macOS for AES backends"
   ],
   "author": {
     "@type": "Person",

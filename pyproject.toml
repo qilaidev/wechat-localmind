@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechat-localmind"
-version = "1.0.0"
-description = "Zero-dependency macOS & Windows WeChat 3.x/4.x local group chat read-only extractor, cleaner, CLI & MCP Server for AI Agents"
+version = "2.0.0"
+description = "Zero-dependency macOS & Windows WeChat 3.x/4.x (WCDB) full-account local read-only chat extractor, cleaner, CLI & MCP Server for AI Agents"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "qilaidev" }]
@@ -13,13 +13,17 @@ requires-python = ">=3.10"
 dependencies = []
 keywords = [
     "wechat",
+    "wcdb",
     "mcp-server",
     "ai-agent",
     "cli",
     "sqlcipher",
+    "zstd",
+    "fts5",
     "macos",
     "windows",
     "local-first",
+    "read-only",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",

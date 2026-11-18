@@ -12,6 +12,32 @@ EXIT_POLICY_DENIED = 3
 EXIT_RESOURCE_NOT_FOUND = 4
 EXIT_INTERNAL_DB_ERROR = 5
 
+# Session scopes & normalized chat types
+VALID_CHAT_SCOPES = ("all", "groups", "direct", "official")
+VALID_CHAT_TYPES = ("all", "group", "direct", "official")
+
+BUILTIN_WECHAT_NAMES = {
+    "filehelper": "文件传输助手",
+    "weixin": "微信团队",
+    "notifymessage": "服务通知",
+    "fmessage": "朋友推荐消息",
+    "medianote": "语音记事本",
+    "floatbottle": "漂流瓶",
+    "qmessage": "QQ离线消息",
+    "qqmail": "QQ邮箱提醒",
+    "newsapp": "腾讯新闻",
+}
+
+OFFICIAL_SYSTEM_IDS = frozenset({
+    "weixin",
+    "notifymessage",
+    "officialaccounts",
+    "brandsessionholder",
+    "brandservicesessionholder",
+    "newsapp",
+    "qqmail",
+})
+
 # Default macOS & Windows WeChat Data Paths
 DEFAULT_MAC_WECHAT_CONTAINER_DIR = Path(
     os.path.expanduser("~/Library/Containers/com.tencent.xinWeChat/Data")

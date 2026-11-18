@@ -7,7 +7,7 @@ import unicodedata
 from typing import Any
 
 from .config import AppConfig
-from .constants import ACK_NOISE_PHRASES, DEFAULT_REPLY_SNIPPET_MAX_LEN
+from .constants import ACK_NOISE_PHRASES, BUILTIN_WECHAT_NAMES, DEFAULT_REPLY_SNIPPET_MAX_LEN
 
 BIDI_CONTROL_CHARS_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 # WeChat uses \u2005 (Four-Per-Em Space) after @mentions in group chat text
@@ -26,14 +26,20 @@ def clean_unicode_display_name(val: str | None) -> str:
 def format_fallback_sender_name(wxid: str | None) -> str:
     """Format anonymized fallback name when contact remark, group nickname, and nickname are all empty."""
     if not wxid:
-        return "未知群友"
+        return "未知联系人"
     clean = wxid.strip()
+    if clean in BUILTIN_WECHAT_NAMES:
+        return BUILTIN_WECHAT_NAMES[clean]
+    if clean.startswith("gh_"):
+        core = clean[3:]
+        tail = core[-4:] if len(core) >= 4 else core
+        return f"公众号({tail})"
     if clean.startswith("wxid_"):
         core = clean[5:]
         tail = core[-4:] if len(core) >= 4 else core
-        return f"微信群友({tail})"
+        return f"微信用户({tail})"
     tail = clean[-4:] if len(clean) >= 4 else clean
-    return f"群友({tail})"
+    return f"联系人({tail})"
 
 
 def disambiguate_punctuation_name(name: str, wxid: str | None) -> str:
@@ -86,7 +92,6 @@ def replace_wechat_mentions(
     if not text:
         return "", mentions_me
 
-    # Normalize WeChat \u2005 space after @name into standard space
     cleaned = text.replace(WECHAT_AT_SPACE, " ")
     my_label = f"[@{config.my_display_label}]"
 
@@ -109,7 +114,7 @@ def replace_wechat_mentions(
                 return my_label
             if callable(name_resolver):
                 resolved = name_resolver(raw_wxid)
-                if resolved and not resolved.startswith("微信群友("):
+                if resolved and not resolved.startswith(("微信用户(", "联系人(", "未知联系人")):
                     return f"@{resolved}"
             return match.group(0)
 
@@ -126,7 +131,6 @@ def is_pure_emoji_text(s: str) -> bool:
     stripped = "".join(ch for ch in s if not ch.isspace())
     if not stripped or len(stripped) > 12:
         return False
-    # Check WeChat single built-in emoji tag e.g. [OK], [握手], [强]
     if re.fullmatch(r"(\[[A-Za-z\u4e00-\u9fff]{1,4}\]){1,2}", stripped):
         return True
     for ch in stripped:

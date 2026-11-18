@@ -16,6 +16,8 @@ from .constants import (
     EXIT_INTERNAL_DB_ERROR,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
+    VALID_CHAT_SCOPES,
+    VALID_CHAT_TYPES,
 )
 from .crypto import (
     decrypt_sqlcipher_database,
@@ -25,6 +27,7 @@ from .crypto import (
 from .db import QueryEngine
 from .errors import EnvOrPermissionError, UsageError, WXLocalMindError
 from .formatter import (
+    format_chats_markdown,
     format_fetch_markdown,
     format_groups_markdown,
     format_json_output,
@@ -85,7 +88,7 @@ def _add_common_options(parser: argparse.ArgumentParser, default_format: str = "
 def build_parser() -> argparse.ArgumentParser:
     parser = _RigorousArgumentParser(
         prog="wechat-localmind",
-        description="WeChat-LocalMind: macOS & Windows WeChat Local Group Data Extraction Capability Layer (CLI & MCP).",
+        description="WeChat-LocalMind: macOS & Windows WeChat Local Chat Data Extraction Capability Layer (CLI & MCP).",
     )
     parser.add_argument(
         "-v",
@@ -154,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 4. config
     p_cfg = subparsers.add_parser(
         "config",
-        help="Inspect or update identity anchor and group blacklist/whitelist rules.",
+        help="Inspect or update identity anchor, chat scope, and blacklist/whitelist rules.",
     )
     cfg_sub = p_cfg.add_subparsers(dest="config_action", metavar="<action>")
 
@@ -162,30 +165,62 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(p_cfg_show, default_format="json")
 
     p_cfg_id = cfg_sub.add_parser("set-identity", help="Set user's display name and WeChat wxid/alias anchor.")
-    p_cfg_id.add_argument("--name", required=True, help="Your display name in groups (e.g. '张工').")
+    p_cfg_id.add_argument("--name", required=True, help="Your display name (e.g. '张工').")
     p_cfg_id.add_argument("--wxid", default="", help="Your WeChat ID (e.g. 'wxid_xxx').")
     p_cfg_id.add_argument("--alias", default="", help="Your custom WeChat alias ID.")
     _add_common_options(p_cfg_id, default_format="json")
 
-    p_cfg_mode = cfg_sub.add_parser("set-mode", help="Switch group filtering mode (blacklist | whitelist).")
+    p_cfg_scope = cfg_sub.add_parser(
+        "set-scope",
+        help="Set accessible session scope (all | groups | direct | official).",
+    )
+    p_cfg_scope.add_argument(
+        "scope",
+        choices=list(VALID_CHAT_SCOPES),
+        help="Target chat scope ('all' enables all chats; 'groups' restricts to @chatroom; 'direct' restricts to 1-on-1 DMs).",
+    )
+    _add_common_options(p_cfg_scope, default_format="json")
+
+    p_cfg_mode = cfg_sub.add_parser("set-mode", help="Switch chat filtering mode (blacklist | whitelist).")
     p_cfg_mode.add_argument("mode", choices=["blacklist", "whitelist"], help="Target filter mode.")
     _add_common_options(p_cfg_mode, default_format="json")
 
     for act, help_txt in (
-        ("block", "Add group chat_id(s) to blacklist."),
-        ("unblock", "Remove group chat_id(s) from blacklist."),
-        ("allow", "Add group chat_id(s) to whitelist."),
-        ("disallow", "Remove group chat_id(s) from whitelist."),
+        ("block", "Add chat_id(s) (wxid_*, @chatroom, gh_*, filehelper) to blacklist."),
+        ("unblock", "Remove chat_id(s) from blacklist."),
+        ("allow", "Add chat_id(s) (wxid_*, @chatroom, gh_*, filehelper) to whitelist."),
+        ("disallow", "Remove chat_id(s) from whitelist."),
     ):
         p_act = cfg_sub.add_parser(act, help=help_txt)
-        p_act.add_argument("chats", nargs="+", help="One or more group chat_ids (@chatroom), comma-separated.")
+        p_act.add_argument("chats", nargs="+", help="One or more WeChat chat_ids, comma-separated.")
         _add_common_options(p_act, default_format="json")
 
-    # 5. groups / list-groups
+    # 5. chats / list-chats (primary all-chats listing)
+    for cmd_name in ("chats", "list-chats"):
+        p_chats = subparsers.add_parser(
+            cmd_name,
+            help="List accessible WeChat chat sessions (1-on-1 DMs, groups, official accounts) and latest cursors.",
+        )
+        p_chats.add_argument(
+            "--type",
+            dest="chat_type",
+            choices=list(VALID_CHAT_TYPES),
+            default="all",
+            help="Filter by chat type: all (default), direct, group, or official.",
+        )
+        p_chats.add_argument("--keyword", default=None, help="Filter chats by name, wxid, or alias keyword.")
+        p_chats.add_argument(
+            "--include-blocked",
+            action="store_true",
+            help="Include chats blocked by current scope or blacklist/whitelist policy.",
+        )
+        _add_common_options(p_chats, default_format="json")
+
+    # 6. groups / list-groups (backward-compatible group-filtered alias)
     for cmd_name in ("groups", "list-groups"):
         p_grp = subparsers.add_parser(
             cmd_name,
-            help="List accessible WeChat group chats (@chatroom) and their latest message cursors.",
+            help="List accessible WeChat group chats (@chatroom / @im.chatroom) and their latest message cursors.",
         )
         p_grp.add_argument("--keyword", default=None, help="Filter groups by name or chat_id keyword.")
         p_grp.add_argument(
@@ -195,16 +230,23 @@ def build_parser() -> argparse.ArgumentParser:
         )
         _add_common_options(p_grp, default_format="json")
 
-    # 6. fetch
+    # 7. fetch
     p_fetch = subparsers.add_parser(
         "fetch",
-        help="Fetch cleaned group chat messages by incremental cursor (--after-id) or time window (--since).",
+        help="Fetch cleaned WeChat messages across 1-on-1 DMs, groups, or official accounts by cursor (--after-id) or time window (--since).",
     )
     p_fetch.add_argument(
         "--chats",
         required=True,
         action="append",
-        help="Comma-separated group chat_ids (@chatroom) or 'ALL_ALLOWED'.",
+        help="Comma-separated chat_ids (wxid_*, alias, @chatroom, gh_*, filehelper) or 'ALL_ALLOWED' / 'ALL_DIRECT' / 'ALL_GROUPS' / 'ALL_OFFICIAL'.",
+    )
+    p_fetch.add_argument(
+        "--type",
+        dest="chat_type",
+        choices=list(VALID_CHAT_TYPES),
+        default="all",
+        help="Optional session type filter (all, direct, group, official).",
     )
     p_fetch.add_argument(
         "--after-id",
@@ -226,13 +268,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--context-buffer",
         type=int,
         default=None,
-        help="Number of preceding messages per group to include as context buffer (default: 10).",
+        help="Number of preceding messages per chat to include as context buffer (default: 10).",
     )
     p_fetch.add_argument(
         "--limit",
         type=int,
         default=DEFAULT_FETCH_LIMIT,
-        help=f"Maximum messages per group chat (default: {DEFAULT_FETCH_LIMIT}, max: 3000).",
+        help=f"Maximum messages per chat session (default: {DEFAULT_FETCH_LIMIT}, max: 3000).",
     )
     fold_grp = p_fetch.add_mutually_exclusive_group()
     fold_grp.add_argument(
@@ -258,17 +300,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_options(p_fetch, default_format="md")
 
-    # 7. search
+    # 8. search
     p_search = subparsers.add_parser(
         "search",
-        help="Search messages across allowed WeChat groups with surrounding context window.",
+        help="Search messages across allowed WeChat chats (1-on-1 DMs, groups, official accounts) with surrounding context.",
     )
     p_search.add_argument("--query", "-k", required=True, help="Keyword to search in messages and attachment titles.")
     p_search.add_argument(
         "--chats",
         action="append",
         default=None,
-        help="Optional group chat_ids (@chatroom) or 'ALL_ALLOWED'.",
+        help="Optional chat_ids or 'ALL_ALLOWED' / 'ALL_DIRECT' / 'ALL_GROUPS' / 'ALL_OFFICIAL'.",
+    )
+    p_search.add_argument(
+        "--type",
+        dest="chat_type",
+        choices=list(VALID_CHAT_TYPES),
+        default="all",
+        help="Optional session type filter (all, direct, group, official).",
     )
     p_search.add_argument("--since", default=None, help="Optional time window filter (e.g. '30d', '7d').")
     p_search.add_argument(
@@ -280,10 +329,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--limit", type=int, default=50, help="Maximum matched messages to return (default: 50).")
     _add_common_options(p_search, default_format="md")
 
-    # 8. export-media
+    # 9. export-media
     p_media = subparsers.add_parser(
         "export-media",
-        help="Safely export group media attachments (auto-decoding .dat XOR images, voice, documents) by msg_id.",
+        help="Safely export chat media attachments (auto-decoding .dat XOR / V1-V2 images, voice, documents) by msg_id.",
     )
     p_media.add_argument(
         "--msg-ids",
@@ -301,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_options(p_media, default_format="json")
 
-    # 9. clean
+    # 10. clean
     p_clean = subparsers.add_parser(
         "clean",
         help="Clean exported media cache or destroy local decrypted & unified SQLite snapshot files.",
@@ -318,14 +367,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_options(p_clean, default_format="json")
 
-    # 10. mcp-serve
+    # 11. mcp-serve
     p_mcp = subparsers.add_parser(
         "mcp-serve",
         help="Start read-only Model Context Protocol (MCP) Server over Stdio.",
     )
     p_mcp.add_argument("--config", type=Path, default=None, help="Optional path to config.json.")
 
-    # 11. install
+    # 12. install
     p_inst = subparsers.add_parser(
         "install",
         help="Install `wechat-localmind` CLI symlink to ~/.local/bin and optionally install SKILL.md bundle.",
@@ -375,6 +424,7 @@ def _handle_doctor(args: argparse.Namespace) -> str:
         "snapshot_engine": snapshot_status,
         "config": {
             "config_path": str(args.config or DEFAULT_CONFIG_PATH),
+            "chat_scope": cfg.chat_scope,
             "filter_mode": cfg.filter_mode,
             "identity_label": cfg.my_display_label,
             "blacklist_count": len(cfg.blacklist_chats),
@@ -397,7 +447,7 @@ def _handle_doctor(args: argparse.Namespace) -> str:
             f"- 统一快照路径: `{snapshot_status.get('snapshot_db_path')}` (构建耗时: `{snapshot_status.get('backup_duration_ms')} ms`)",
             f"- 全局最新消息游标 (`global_latest_msg_id`): `{snapshot_status.get('global_latest_msg_id')}`",
             f"- 原库最后活跃时间: `{snapshot_status.get('db_latest_msg_time')}`",
-            f"- 当前身份锚点: `{cfg.my_display_label}` | 过滤模式: `{cfg.filter_mode}`",
+            f"- 当前身份锚点: `{cfg.my_display_label}` | 会话范围: `{cfg.chat_scope}` | 过滤模式: `{cfg.filter_mode}`",
         ]
         for w in warnings:
             lines.append(f"- [⚠️ 预警 {w.get('code')}]: {w.get('message')}")
@@ -461,7 +511,6 @@ def _handle_key(args: argparse.Namespace) -> str:
         matched_map = extract_keys_from_memory_dump(dump_path.read_bytes(), all_dbs)
         for db_n, hex_k in matched_map.items():
             cfg.db_keys[db_n] = hex_k
-        # If multiple DBs share one pre-PBKDF2 master key and global raw_key_hex is unset, promote it
         unique_matched = set(matched_map.values())
         if len(matched_map) >= 2 and len(unique_matched) == 1 and not cfg.raw_key_hex:
             cfg.raw_key_hex = next(iter(unique_matched))
@@ -533,6 +582,13 @@ def _handle_config(args: argparse.Namespace) -> str:
             {"status": "updated", "config_path": str(saved), "identity": cfg.to_dict()["identity"]}
         )
 
+    if action == "set-scope":
+        cfg.chat_scope = args.scope
+        saved = cfg.save(cfg_path)
+        return format_json_output(
+            {"status": "updated", "config_path": str(saved), "chat_scope": cfg.chat_scope}
+        )
+
     if action == "set-mode":
         cfg.filter_mode = args.mode
         saved = cfg.save(cfg_path)
@@ -542,8 +598,8 @@ def _handle_config(args: argparse.Namespace) -> str:
 
     chats = _split_csv_list(getattr(args, "chats", []))
     for c in chats:
-        if not AppConfig.is_group_chat_id(c):
-            raise UsageError(f"Invalid WeChat group chat_id '{c}': group IDs must end with '@chatroom'.")
+        if not AppConfig.is_valid_chat_id(c):
+            raise UsageError(f"Invalid WeChat chat_id '{c}'.")
 
     if action == "block":
         for c in chats:
@@ -566,6 +622,7 @@ def _handle_config(args: argparse.Namespace) -> str:
             "status": "updated",
             "action": action,
             "config_path": str(saved),
+            "chat_scope": cfg.chat_scope,
             "filter_mode": cfg.filter_mode,
             "blacklist_chats": cfg.blacklist_chats,
             "whitelist_chats": cfg.whitelist_chats,
@@ -594,7 +651,19 @@ def _handle_install(args: argparse.Namespace) -> str:
     if args.skill_dir:
         src_skill_dir = repo_root / "skills" / "wechat-localmind"
         dst_skill_dir = args.skill_dir.expanduser().resolve() / "wechat-localmind"
-        if dst_skill_dir.exists():
+        if dst_skill_dir.is_symlink():
+            if dst_skill_dir.resolve() == src_skill_dir.resolve():
+                skill_installed_to = str(dst_skill_dir)
+                return format_json_output(
+                    {
+                        "status": "installed",
+                        "cli_symlink": str(target_bin),
+                        "cli_target": str(bin_script),
+                        "skill_bundle_dir": skill_installed_to,
+                    }
+                )
+            dst_skill_dir.unlink()
+        elif dst_skill_dir.exists():
             shutil.rmtree(dst_skill_dir)
         dst_skill_dir.mkdir(parents=True, exist_ok=True)
         if (src_skill_dir / "SKILL.md").exists():
@@ -662,6 +731,20 @@ def main(argv: list[str] | None = None) -> int:
 
         snap = snap_mgr.ensure_snapshot(force_fresh=args.fresh)
 
+        if args.subcommand in ("chats", "list-chats"):
+            with QueryEngine(cfg, snap) as engine:
+                res = engine.list_chats(
+                    keyword=args.keyword,
+                    include_blocked=args.include_blocked,
+                    chat_type=args.chat_type,
+                )
+            if args.format in ("md", "markdown"):
+                out = format_chats_markdown(res)
+            else:
+                out = format_json_output(res)
+            sys.stdout.write(out)
+            return EXIT_SUCCESS
+
         if args.subcommand in ("groups", "list-groups"):
             with QueryEngine(cfg, snap) as engine:
                 res = engine.list_groups(
@@ -685,6 +768,7 @@ def main(argv: list[str] | None = None) -> int:
                     until_str=args.until,
                     context_buffer_count=args.context_buffer,
                     limit_per_chat=args.limit,
+                    chat_type=args.chat_type,
                 )
             if args.format == "json":
                 out = format_json_output(res)
@@ -716,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
                     since_str=args.since,
                     context_window=args.context,
                     limit=args.limit,
+                    chat_type=args.chat_type,
                 )
             if args.format == "json":
                 out = format_json_output(res)

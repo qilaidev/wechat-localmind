@@ -10,7 +10,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
-from .config import AppConfig
+from .cleaner import clean_unicode_display_name, format_fallback_sender_name
+from .config import AppConfig, classify_wx_chat_id
 from .constants import (
     DAT_IMAGE_SIGNATURES,
     WECHAT4_DAT_V1_DEFAULT_AES_KEY,
@@ -306,25 +307,52 @@ class MediaExporter:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
+        cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wx_chats'")
+        has_wx_chats = cur.fetchone() is not None
+
         exported_items: list[dict[str, Any]] = []
         try:
             for mid in msg_ids:
-                cur.execute(
-                    """
-                    SELECT
-                        m.msg_id,
-                        m.chat_id,
-                        m.local_type,
-                        m.raw_content,
-                        m.compress_content,
-                        m.packed_info_data,
-                        COALESCE(g.group_name, '未命名微信群') AS group_name
-                    FROM wx_messages m
-                    LEFT JOIN wx_groups g ON m.chat_id = g.chat_id
-                    WHERE m.msg_id = ?
-                    """,
-                    (mid,),
-                )
+                if has_wx_chats:
+                    cur.execute(
+                        """
+                        SELECT
+                            m.msg_id,
+                            m.chat_id,
+                            m.local_type,
+                            m.raw_content,
+                            m.compress_content,
+                            m.packed_info_data,
+                            c.chat_name,
+                            c.chat_type,
+                            ct.alias AS contact_alias
+                        FROM wx_messages m
+                        LEFT JOIN wx_chats c ON m.chat_id = c.chat_id
+                        LEFT JOIN wx_contacts ct ON m.chat_id = ct.username
+                        WHERE m.msg_id = ?
+                        """,
+                        (mid,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT
+                            m.msg_id,
+                            m.chat_id,
+                            m.local_type,
+                            m.raw_content,
+                            m.compress_content,
+                            m.packed_info_data,
+                            g.group_name AS chat_name,
+                            NULL AS chat_type,
+                            ct.alias AS contact_alias
+                        FROM wx_messages m
+                        LEFT JOIN wx_groups g ON m.chat_id = g.chat_id
+                        LEFT JOIN wx_contacts ct ON m.chat_id = ct.username
+                        WHERE m.msg_id = ?
+                        """,
+                        (mid,),
+                    )
                 row = cur.fetchone()
                 if row is None:
                     raise ResourceNotFoundError(
@@ -332,9 +360,9 @@ class MediaExporter:
                         error_code="MESSAGE_NOT_FOUND",
                     )
 
-                chat_id = row["chat_id"] or ""
-                # Policy enforcement: 100% reject private chats and blocked groups (Exit Code 3)
-                self.config.assert_chat_allowed(chat_id)
+                chat_id = (row["chat_id"] or "").strip()
+                alias_id = (row["contact_alias"] or "").strip() or None
+                self.config.assert_chat_allowed(chat_id, alias_id=alias_id)
 
                 parsed = parse_wechat_message_payload(
                     int(row["local_type"] or 1),
@@ -397,11 +425,18 @@ class MediaExporter:
                 except OSError:
                     pass
 
+                ctype = row["chat_type"] or classify_wx_chat_id(chat_id)
+                cname = (
+                    clean_unicode_display_name(row["chat_name"])
+                    or ("未命名微信群" if ctype == "group" else format_fallback_sender_name(chat_id))
+                )
                 exported_items.append(
                     {
                         "msg_id": mid,
                         "chat_id": chat_id,
-                        "group_name": row["group_name"],
+                        "chat_name": cname,
+                        "group_name": cname,
+                        "chat_type": ctype,
                         "media_type": parsed.normalized_type or "media",
                         "mime_type": mime_type,
                         "xor_key_byte": f"0x{xor_key_used:02x}" if xor_key_used is not None else None,

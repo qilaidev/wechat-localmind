@@ -1,4 +1,4 @@
-"""Read-only SQLite query engine, 4-tier WeChat real-name resolver, and message pipeline."""
+"""Read-only SQLite query engine, 4-tier WeChat real-name resolver, and full-account message pipeline."""
 
 from __future__ import annotations
 
@@ -18,13 +18,15 @@ from .cleaner import (
     replace_wechat_mentions,
     truncate_reply_snippet,
 )
-from .config import AppConfig
+from .config import AppConfig, classify_wx_chat_id
 from .constants import (
+    BUILTIN_WECHAT_NAMES,
     DEFAULT_FETCH_LIMIT,
     EXCLUDED_MSG_TYPES,
     MAX_FETCH_LIMIT,
     MEDIA_MSG_TYPES,
     SYNC_LAG_WARNING_SEC,
+    VALID_CHAT_TYPES,
 )
 from .errors import ResourceNotFoundError, UsageError
 from .media import resolve_safe_sandbox_path
@@ -60,8 +62,21 @@ def parse_since_to_epoch(since_str: str | None, now_epoch: float | None = None) 
         ) from exc
 
 
+def normalize_chat_type_filter(chat_type: str | None) -> str:
+    if not chat_type:
+        return "all"
+    ct = chat_type.strip().lower()
+    if ct == "groups":
+        ct = "group"
+    if ct not in VALID_CHAT_TYPES:
+        raise UsageError(
+            f"Invalid chat type filter '{chat_type}'. Expected one of {VALID_CHAT_TYPES}."
+        )
+    return ct
+
+
 class QueryEngine:
-    """Executes read-only queries against the unified WeChat SQLite snapshot."""
+    """Executes read-only queries against the unified WeChat SQLite snapshot across all chat sessions."""
 
     def __init__(self, config: AppConfig, snapshot: SnapshotState) -> None:
         self.config = config
@@ -69,6 +84,11 @@ class QueryEngine:
         self._conn: sqlite3.Connection | None = None
         self._global_contact_names: dict[str, str] | None = None
         self._group_member_names: dict[tuple[str, str], str] | None = None
+        self._contact_remarks: dict[str, str] = {}
+        self._contact_nicknames: dict[str, str] = {}
+        self._wxid_to_alias: dict[str, str] = {}
+        self._alias_to_wxid: dict[str, str] = {}
+        self._has_wx_chats_table: bool | None = None
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -76,6 +96,13 @@ class QueryEngine:
             self._conn = sqlite3.connect(uri, uri=True, timeout=5.0)
             self._conn.row_factory = sqlite3.Row
         return self._conn
+
+    def _check_has_wx_chats(self) -> bool:
+        if self._has_wx_chats_table is None:
+            cur = self._get_conn().cursor()
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='wx_chats'")
+            self._has_wx_chats_table = cur.fetchone() is not None
+        return self._has_wx_chats_table
 
     def close(self) -> None:
         if self._conn is not None:
@@ -116,9 +143,9 @@ class QueryEngine:
     def _ensure_name_maps(self) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
         """Build 4-tier real-name dictionaries:
         Tier 1: Contact Remark (`wx_contacts.remark`)
-        Tier 2: Group Display Nickname (`wx_group_members.group_nickname`)
-        Tier 3: Contact Nickname (`wx_contacts.nick_name`)
-        Tier 4: Fallback anonymized wxid (`微信群友(xxxx)`)
+        Tier 2: Group Display Nickname (`wx_group_members.group_nickname`, in group chats)
+        Tier 3: Contact Nickname (`wx_contacts.nick_name`) / Builtin Name
+        Tier 4: Fallback anonymized wxid (`微信用户(xxxx)` / `公众号(xxxx)`)
         """
         if self._global_contact_names is not None and self._group_member_names is not None:
             return self._global_contact_names, self._group_member_names
@@ -128,15 +155,27 @@ class QueryEngine:
 
         remarks: dict[str, str] = {}
         nicknames: dict[str, str] = {}
-        cur.execute("SELECT username, nick_name, remark FROM wx_contacts")
+        wxid_to_alias: dict[str, str] = {}
+        alias_to_wxid: dict[str, str] = {}
+
+        cur.execute("PRAGMA table_info(wx_contacts)")
+        c_cols = {r[1] for r in cur.fetchall()}
+        alias_sel = "alias" if "alias" in c_cols else "NULL AS alias"
+        cur.execute(f"SELECT username, nick_name, remark, {alias_sel} FROM wx_contacts")
         for r in cur.fetchall():
             u = (r["username"] or "").strip()
+            if not u:
+                continue
             rem = clean_unicode_display_name(r["remark"])
             nick = clean_unicode_display_name(r["nick_name"])
+            al = (r["alias"] or "").strip()
             if rem:
                 remarks[u] = rem
             if nick:
                 nicknames[u] = nick
+            if al:
+                wxid_to_alias[u] = al
+                alias_to_wxid[al] = u
 
         group_nicks: dict[tuple[str, str], str] = {}
         cur.execute("SELECT chat_id, member_wxid, group_nickname FROM wx_group_members")
@@ -152,12 +191,30 @@ class QueryEngine:
             raw = remarks.get(u) or nicknames.get(u) or ""
             global_names[u] = disambiguate_punctuation_name(raw, u)
 
-        # Store remarks separately so Tier 1 (remark) beats Tier 2 (group nickname)
         self._contact_remarks = remarks
         self._contact_nicknames = nicknames
+        self._wxid_to_alias = wxid_to_alias
+        self._alias_to_wxid = alias_to_wxid
         self._global_contact_names = global_names
         self._group_member_names = group_nicks
         return global_names, group_nicks
+
+    def resolve_chat_name(self, chat_id: str, stored_name: str | None = None) -> str:
+        """Resolve display title for any WeChat session (group, 1-on-1 direct, official, builtin)."""
+        self._ensure_name_maps()
+        ctype = classify_wx_chat_id(chat_id)
+        if chat_id in self._contact_remarks:
+            return disambiguate_punctuation_name(self._contact_remarks[chat_id], chat_id)
+        clean_stored = clean_unicode_display_name(stored_name)
+        if clean_stored and clean_stored not in ("未命名微信群", "未知联系人"):
+            return disambiguate_punctuation_name(clean_stored, chat_id) if ctype != "group" else clean_stored
+        if chat_id in self._contact_nicknames:
+            return disambiguate_punctuation_name(self._contact_nicknames[chat_id], chat_id) if ctype != "group" else self._contact_nicknames[chat_id]
+        if chat_id in BUILTIN_WECHAT_NAMES:
+            return BUILTIN_WECHAT_NAMES[chat_id]
+        if ctype == "group":
+            return "未命名微信群"
+        return format_fallback_sender_name(chat_id)
 
     def resolve_sender_name(
         self,
@@ -174,80 +231,167 @@ class QueryEngine:
         ):
             return self.config.my_display_label
 
-        if not sender_wxid:
-            return "未知群友"
+        eff_wxid = (sender_wxid or "").strip()
+        if not eff_wxid and not AppConfig.is_group_chat_id(chat_id):
+            eff_wxid = chat_id
+
+        if not eff_wxid:
+            return "未知联系人"
 
         self._ensure_name_maps()
         # Tier 1: Contact Remark
-        if sender_wxid in self._contact_remarks:
-            return disambiguate_punctuation_name(self._contact_remarks[sender_wxid], sender_wxid)
-        # Tier 2: Group Display Name
-        if self._group_member_names and (chat_id, sender_wxid) in self._group_member_names:
-            return disambiguate_punctuation_name(self._group_member_names[(chat_id, sender_wxid)], sender_wxid)
-        # Tier 3: Contact Nickname
-        if sender_wxid in self._contact_nicknames:
-            return disambiguate_punctuation_name(self._contact_nicknames[sender_wxid], sender_wxid)
+        if eff_wxid in self._contact_remarks:
+            return disambiguate_punctuation_name(self._contact_remarks[eff_wxid], eff_wxid)
+        # Tier 2: Group Display Name (when in a group chat)
+        if self._group_member_names and (chat_id, eff_wxid) in self._group_member_names:
+            return disambiguate_punctuation_name(self._group_member_names[(chat_id, eff_wxid)], eff_wxid)
+        # Tier 3: Contact Nickname or Built-in Name
+        if eff_wxid in self._contact_nicknames:
+            return disambiguate_punctuation_name(self._contact_nicknames[eff_wxid], eff_wxid)
+        if eff_wxid in BUILTIN_WECHAT_NAMES:
+            return BUILTIN_WECHAT_NAMES[eff_wxid]
         # Tier 4: Fallback
-        return format_fallback_sender_name(sender_wxid)
+        return format_fallback_sender_name(eff_wxid)
 
-    def list_groups(
-        self,
-        keyword: str | None = None,
-        include_blocked: bool = False,
-    ) -> dict[str, Any]:
-        """List WeChat group sessions (@chatroom) with latest cursor, 24h message counts, and policy status."""
+    def _query_all_raw_sessions(self) -> list[dict[str, Any]]:
+        """Query all sessions with latest cursor and 24h stats across v3 (`wx_chats`) or legacy (`wx_groups`) snapshots."""
+        self._ensure_name_maps()
         conn = self._get_conn()
         cur = conn.cursor()
         since_24h_epoch = int(time.time() - 86400)
-
         excl_placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
         m_ctime_expr = (
             "(CASE WHEN m.create_time > 100000000000 THEN m.create_time / 1000 ELSE m.create_time END)"
             if self.snapshot.arch_version == "unified_sqlite"
             else "m.create_time"
         )
-        sql = f"""
+
+        if self._check_has_wx_chats():
+            sql = f"""
+                SELECT
+                    c.chat_id,
+                    c.chat_name,
+                    c.chat_type,
+                    c.member_count,
+                    c.last_active_epoch,
+                    COALESCE(MAX(m.msg_id), 0) AS latest_msg_id,
+                    MAX({m_ctime_expr}) AS latest_msg_time,
+                    SUM(CASE WHEN {m_ctime_expr} >= ? THEN 1 ELSE 0 END) AS msg_count_24h
+                FROM wx_chats c
+                LEFT JOIN wx_messages m
+                    ON m.chat_id = c.chat_id
+                    AND m.local_type NOT IN ({excl_placeholders})
+                GROUP BY c.chat_id
+                ORDER BY COALESCE(MAX({m_ctime_expr}), c.last_active_epoch, 0) DESC
+            """
+            cur.execute(sql, [since_24h_epoch, *EXCLUDED_MSG_TYPES])
+            rows = cur.fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                cid = (r["chat_id"] or "").strip()
+                if not cid:
+                    continue
+                ctype = r["chat_type"] or classify_wx_chat_id(cid)
+                out.append(
+                    {
+                        "chat_id": cid,
+                        "chat_name": self.resolve_chat_name(cid, r["chat_name"]),
+                        "chat_type": ctype,
+                        "member_count": int(r["member_count"] or 0),
+                        "latest_msg_id": int(r["latest_msg_id"] or 0),
+                        "last_ts": r["latest_msg_time"] if r["latest_msg_time"] is not None else r["last_active_epoch"],
+                        "msg_count_24h": int(r["msg_count_24h"] or 0),
+                    }
+                )
+            return out
+
+        # Fallback for external legacy `WeChat_Unified.sqlite` files without `wx_chats`
+        sql_legacy = f"""
+            WITH all_ids AS (
+                SELECT chat_id, group_name AS raw_name, member_count, last_active_epoch FROM wx_groups
+                UNION
+                SELECT DISTINCT m.chat_id, NULL AS raw_name, 0 AS member_count, 0 AS last_active_epoch
+                FROM wx_messages m
+                WHERE m.chat_id NOT IN (SELECT chat_id FROM wx_groups)
+            )
             SELECT
-                g.chat_id,
-                g.group_name,
-                g.member_count,
-                g.last_active_epoch,
+                a.chat_id,
+                a.raw_name,
+                a.member_count,
+                a.last_active_epoch,
                 COALESCE(MAX(m.msg_id), 0) AS latest_msg_id,
                 MAX({m_ctime_expr}) AS latest_msg_time,
                 SUM(CASE WHEN {m_ctime_expr} >= ? THEN 1 ELSE 0 END) AS msg_count_24h
-            FROM wx_groups g
+            FROM all_ids a
             LEFT JOIN wx_messages m
-                ON m.chat_id = g.chat_id
+                ON m.chat_id = a.chat_id
                 AND m.local_type NOT IN ({excl_placeholders})
-            WHERE g.chat_id LIKE '%@chatroom'
-            GROUP BY g.chat_id
-            ORDER BY COALESCE(MAX({m_ctime_expr}), g.last_active_epoch, 0) DESC
+            GROUP BY a.chat_id
+            ORDER BY COALESCE(MAX({m_ctime_expr}), a.last_active_epoch, 0) DESC
         """
-        cur.execute(sql, [since_24h_epoch, *EXCLUDED_MSG_TYPES])
+        cur.execute(sql_legacy, [since_24h_epoch, *EXCLUDED_MSG_TYPES])
+        out = []
+        for r in cur.fetchall():
+            cid = (r["chat_id"] or "").strip()
+            if not cid:
+                continue
+            ctype = classify_wx_chat_id(cid)
+            m_cnt = int(r["member_count"] or 0)
+            if ctype == "direct" and m_cnt == 0:
+                m_cnt = 1 if cid in ("filehelper", self.snapshot.wxid) else 2
+            out.append(
+                {
+                    "chat_id": cid,
+                    "chat_name": self.resolve_chat_name(cid, r["raw_name"]),
+                    "chat_type": ctype,
+                    "member_count": m_cnt,
+                    "latest_msg_id": int(r["latest_msg_id"] or 0),
+                    "last_ts": r["latest_msg_time"] if r["latest_msg_time"] is not None else r["last_active_epoch"],
+                    "msg_count_24h": int(r["msg_count_24h"] or 0),
+                }
+            )
+        return out
 
-        groups: list[dict[str, Any]] = []
+    def list_chats(
+        self,
+        keyword: str | None = None,
+        include_blocked: bool = False,
+        chat_type: str = "all",
+    ) -> dict[str, Any]:
+        """List WeChat sessions (1-on-1 direct, groups, official accounts) with cursors and 24h message counts."""
+        type_filter = normalize_chat_type_filter(chat_type)
+        raw_sessions = self._query_all_raw_sessions()
         kw_lower = keyword.strip().lower() if keyword else None
 
-        for row in cur.fetchall():
-            chat_id = row["chat_id"]
-            group_name = clean_unicode_display_name(row["group_name"]) or "未命名微信群"
-            if kw_lower and kw_lower not in group_name.lower() and kw_lower not in chat_id.lower():
+        chats: list[dict[str, Any]] = []
+        for item in raw_sessions:
+            chat_id = item["chat_id"]
+            ctype = item["chat_type"]
+            if type_filter != "all" and ctype != type_filter:
                 continue
 
-            allowed = self.config.is_chat_allowed(chat_id)
+            chat_name = item["chat_name"]
+            alias_id = self._wxid_to_alias.get(chat_id)
+            if kw_lower:
+                haystack = f"{chat_name} {chat_id} {alias_id or ''}".lower()
+                if kw_lower not in haystack:
+                    continue
+
+            allowed = self.config.is_chat_allowed(chat_id, alias_id=alias_id)
             if not allowed and not include_blocked:
                 continue
 
-            last_ts = row["latest_msg_time"] if row["latest_msg_time"] is not None else row["last_active_epoch"]
-            groups.append(
+            chats.append(
                 {
                     "chat_id": chat_id,
-                    "group_name": group_name,
+                    "chat_name": chat_name,
+                    "group_name": chat_name,
+                    "chat_type": ctype,
                     "allowed": allowed,
-                    "latest_msg_id": int(row["latest_msg_id"] or 0),
-                    "last_active_time": epoch_to_local_iso(last_ts),
-                    "msg_count_24h": int(row["msg_count_24h"] or 0),
-                    "member_count": int(row["member_count"] or 0),
+                    "latest_msg_id": item["latest_msg_id"],
+                    "last_active_time": epoch_to_local_iso(item["last_ts"]),
+                    "msg_count_24h": item["msg_count_24h"],
+                    "member_count": item["member_count"],
                 }
             )
 
@@ -259,51 +403,85 @@ class QueryEngine:
                 "global_latest_msg_id": self.snapshot.global_latest_msg_id,
                 "account_wxid": self.snapshot.wxid,
                 "arch_version": self.snapshot.arch_version,
+                "chat_scope": self.config.chat_scope,
+                "chat_type_filter": type_filter,
                 "filter_mode": self.config.filter_mode,
                 "warnings": self.build_common_warnings(),
             },
-            "groups": groups,
+            "chats": chats,
         }
 
-    def _resolve_target_groups(self, chat_ids: list[str]) -> list[sqlite3.Row]:
+    def list_groups(
+        self,
+        keyword: str | None = None,
+        include_blocked: bool = False,
+    ) -> dict[str, Any]:
+        """Backward-compatible helper listing WeChat group chats (@chatroom / @im.chatroom) with `groups` and `chats` keys."""
+        res = self.list_chats(keyword=keyword, include_blocked=include_blocked, chat_type="group")
+        res["groups"] = res["chats"]
+        return res
+
+    def _resolve_target_chats(self, chat_ids: list[str], chat_type: str = "all") -> list[dict[str, Any]]:
         if not chat_ids:
-            raise UsageError("At least one chat_id (@chatroom) or 'ALL_ALLOWED' must be specified via --chats.")
-
-        conn = self._get_conn()
-        cur = conn.cursor()
-
-        if len(chat_ids) == 1 and chat_ids[0].upper() == "ALL_ALLOWED":
-            cur.execute(
-                """
-                SELECT chat_id, COALESCE(group_name, '未命名微信群') AS group_name
-                FROM wx_groups
-                WHERE chat_id LIKE '%@chatroom'
-                ORDER BY COALESCE(last_active_epoch, 0) DESC
-                """
+            raise UsageError(
+                "At least one chat_id or 'ALL_ALLOWED' / 'ALL_DIRECT' / 'ALL_GROUPS' / 'ALL_OFFICIAL' must be specified via --chats."
             )
-            return [r for r in cur.fetchall() if self.config.is_chat_allowed(r["chat_id"])]
 
-        for cid in chat_ids:
-            self.config.assert_chat_allowed(cid)
+        type_filter = normalize_chat_type_filter(chat_type)
+        raw_sessions = self._query_all_raw_sessions()
+        by_id = {s["chat_id"]: s for s in raw_sessions}
 
-        placeholders = ",".join("?" for _ in chat_ids)
-        cur.execute(
-            f"""
-            SELECT chat_id, COALESCE(group_name, '未命名微信群') AS group_name
-            FROM wx_groups
-            WHERE chat_id IN ({placeholders}) AND chat_id LIKE '%@chatroom'
-            """,
-            chat_ids,
-        )
-        rows_by_id = {r["chat_id"]: r for r in cur.fetchall()}
-        result: list[sqlite3.Row] = []
-        for cid in chat_ids:
-            if cid not in rows_by_id:
-                raise ResourceNotFoundError(
-                    f"WeChat group '{cid}' not found in local database.",
-                    error_code="GROUP_NOT_FOUND",
-                )
-            result.append(rows_by_id[cid])
+        upper_single = chat_ids[0].strip().upper() if len(chat_ids) == 1 else ""
+        if upper_single in ("ALL_ALLOWED", "ALL", "ALL_GROUPS", "ALL_DIRECT", "ALL_OFFICIAL"):
+            effective_type = type_filter
+            if upper_single == "ALL_GROUPS":
+                effective_type = "group"
+            elif upper_single == "ALL_DIRECT":
+                effective_type = "direct"
+            elif upper_single == "ALL_OFFICIAL":
+                effective_type = "official"
+
+            out_all: list[dict[str, Any]] = []
+            for s in raw_sessions:
+                cid = s["chat_id"]
+                if effective_type != "all" and s["chat_type"] != effective_type:
+                    continue
+                if not self.config.is_chat_allowed(cid, alias_id=self._wxid_to_alias.get(cid)):
+                    continue
+                out_all.append(s)
+            return out_all
+
+        result: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for raw_cid in chat_ids:
+            req = raw_cid.strip()
+            resolved_cid = self._alias_to_wxid.get(req, req)
+            alias_id = self._wxid_to_alias.get(resolved_cid) or (req if resolved_cid != req else None)
+
+            # Enforce policy first so out-of-scope or blacklisted chats raise Exit Code 3
+            self.config.assert_chat_allowed(resolved_cid, alias_id=alias_id)
+
+            sess = by_id.get(resolved_cid)
+            if sess is None:
+                # Check if contact exists in wx_contacts with zero messages yet
+                if resolved_cid in self._contact_remarks or resolved_cid in self._contact_nicknames:
+                    sess = {
+                        "chat_id": resolved_cid,
+                        "chat_name": self.resolve_chat_name(resolved_cid),
+                        "chat_type": classify_wx_chat_id(resolved_cid),
+                    }
+                else:
+                    raise ResourceNotFoundError(
+                        f"WeChat chat '{req}' not found in local database.",
+                        error_code="CHAT_NOT_FOUND",
+                    )
+
+            if type_filter != "all" and sess["chat_type"] != type_filter:
+                continue
+
+            if resolved_cid not in seen_ids:
+                seen_ids.add(resolved_cid)
+                result.append(sess)
         return result
 
     def _lookup_parent_reply(
@@ -321,8 +499,7 @@ class QueryEngine:
         cur = conn.cursor()
         row = None
         if quoted_svrid:
-            # Security boundary: bind `chat_id = ?` so spoofed `<refermsg><svrid>` cannot leak
-            # messages or sender remarks across blacklisted or other group chats.
+            # Security boundary: bind `chat_id = ?` so spoofed `<refermsg><svrid>` cannot leak across chats
             cur.execute(
                 """
                 SELECT msg_id, sender_wxid, is_from_me, local_type, raw_content, compress_content, packed_info_data
@@ -342,8 +519,11 @@ class QueryEngine:
                 row["compress_content"],
                 row["packed_info_data"],
             )
+            p_is_me = bool(row["is_from_me"])
             p_sender_wxid = row["sender_wxid"] or p_parsed.sender_wxid_from_prefix
-            p_sender_name = self.resolve_sender_name(bool(row["is_from_me"]), chat_id, p_sender_wxid)
+            if not p_sender_wxid and not p_is_me and not AppConfig.is_group_chat_id(chat_id):
+                p_sender_wxid = chat_id
+            p_sender_name = self.resolve_sender_name(p_is_me, chat_id, p_sender_wxid)
             if p_parsed.is_revoked:
                 return {
                     "msg_id": p_mid,
@@ -359,11 +539,10 @@ class QueryEngine:
                 "status": "ok",
             }
 
-        # Fallback to <refermsg> embedded snippet
         fb_sender = (
             self.resolve_sender_name(False, chat_id, quoted_sender_wxid)
             if quoted_sender_wxid
-            else (clean_unicode_display_name(quoted_display_name) or "群成员")
+            else (clean_unicode_display_name(quoted_display_name) or "历史消息")
         )
         if quoted_text_snippet:
             return {
@@ -412,7 +591,6 @@ class QueryEngine:
             row["packed_info_data"],
         )
 
-        # Skip revoked, pat ([拍一拍]), and system_event messages (100% filtered out from business stream)
         if parsed.is_revoked or parsed.is_pat_message or parsed.normalized_type in ("revoked", "system_event", "pat"):
             return None
 
@@ -424,23 +602,33 @@ class QueryEngine:
                 or (self.config.identity.wxid and sender_wxid == self.config.identity.wxid)
             )
         )
+        if not is_from_me and not sender_wxid and not AppConfig.is_group_chat_id(chat_id):
+            sender_wxid = chat_id
+
         sender_name = self.resolve_sender_name(is_from_me, chat_id, sender_wxid)
         norm_type = parsed.normalized_type or "text"
 
         media_obj: dict[str, Any] | None = None
         if norm_type in MEDIA_MSG_TYPES or parsed.media_rel_path:
             avail, disk_path, disk_size = self._resolve_media_availability(parsed.media_rel_path)
+            within_sandbox = True
+            if parsed.media_rel_path:
+                _, within_sandbox = resolve_safe_sandbox_path(
+                    parsed.media_rel_path,
+                    self.snapshot.account_dir,
+                    self.snapshot.media_root_dir,
+                )
             title = (
                 parsed.media_title
                 or (disk_path.name if disk_path else None)
-                or (os.path.basename(parsed.media_rel_path) if parsed.media_rel_path else None)
+                or (os.path.basename(parsed.media_rel_path.replace("\\", "/")) if parsed.media_rel_path else None)
                 or norm_type
             )
             media_obj = {
                 "media_type": "video" if norm_type == "micro_video" else norm_type,
                 "title": title,
                 "file_ext": parsed.media_ext,
-                "file_size_bytes": parsed.media_size_bytes or disk_size,
+                "file_size_bytes": (parsed.media_size_bytes or disk_size) if within_sandbox else None,
                 "duration_sec": parsed.media_duration_sec,
                 "local_available": avail,
             }
@@ -500,8 +688,9 @@ class QueryEngine:
         until_str: str | None = None,
         context_buffer_count: int | None = None,
         limit_per_chat: int = DEFAULT_FETCH_LIMIT,
+        chat_type: str = "all",
     ) -> dict[str, Any]:
-        """Fetch cleaned WeChat group messages by global cursor (--after-id) or time window (--since)."""
+        """Fetch cleaned WeChat messages across any allowed sessions by cursor (--after-id) or time window (--since)."""
         limit = max(1, min(int(limit_per_chat), MAX_FETCH_LIMIT))
         ctx_count = (
             self.config.cleaning.context_buffer_count
@@ -542,8 +731,11 @@ class QueryEngine:
         else:
             since_epoch = parse_since_to_epoch(since_str or "24h", now_epoch)
 
-        groups = self._resolve_target_groups(chat_ids)
-        is_explicit = not (len(chat_ids) == 1 and chat_ids[0].upper() == "ALL_ALLOWED")
+        target_sessions = self._resolve_target_chats(chat_ids, chat_type=chat_type)
+        is_wildcard = (
+            len(chat_ids) == 1
+            and chat_ids[0].strip().upper() in ("ALL_ALLOWED", "ALL", "ALL_GROUPS", "ALL_DIRECT", "ALL_OFFICIAL")
+        )
 
         conn = self._get_conn()
         cur = conn.cursor()
@@ -551,9 +743,10 @@ class QueryEngine:
 
         chats_result: list[dict[str, Any]] = []
 
-        for grp in groups:
-            chat_id = grp["chat_id"]
-            group_name = clean_unicode_display_name(grp["group_name"]) or "未命名微信群"
+        for sess in target_sessions:
+            chat_id = sess["chat_id"]
+            chat_name = sess["chat_name"]
+            sess_type = sess["chat_type"]
 
             where_clauses = [
                 "chat_id = ?",
@@ -602,7 +795,7 @@ class QueryEngine:
                 if item is not None:
                     new_messages.append(item)
 
-            if not new_messages and not is_explicit:
+            if not new_messages and is_wildcard:
                 continue
 
             buffer_messages: list[dict[str, Any]] = []
@@ -644,7 +837,9 @@ class QueryEngine:
             chats_result.append(
                 {
                     "chat_id": chat_id,
-                    "group_name": group_name,
+                    "chat_name": chat_name,
+                    "group_name": chat_name,
+                    "chat_type": sess_type,
                     "chat_min_msg_id": chat_min_id,
                     "chat_latest_msg_id": chat_max_id,
                     "new_message_count": len(new_messages),
@@ -663,6 +858,7 @@ class QueryEngine:
                 "request_after_msg_id": after_msg_id,
                 "global_latest_msg_id": self.snapshot.global_latest_msg_id,
                 "account_wxid": self.snapshot.wxid,
+                "chat_scope": self.config.chat_scope,
                 "my_identity": self.config.my_display_label,
                 "warnings": warnings,
             },
@@ -676,15 +872,16 @@ class QueryEngine:
         since_str: str | None = None,
         context_window: int = 3,
         limit: int = 50,
+        chat_type: str = "all",
     ) -> dict[str, Any]:
-        """Search messages across allowed WeChat groups (including zstd-compressed XML/text) with +/- N context."""
+        """Search messages across allowed WeChat sessions (including zstd-compressed XML/text) with +/- N context."""
         q_clean = (query or "").strip()
         if not q_clean:
             raise UsageError("Search --query cannot be empty.")
 
         target_chats = chat_ids if chat_ids else ["ALL_ALLOWED"]
-        groups = self._resolve_target_groups(target_chats)
-        if not groups:
+        sessions = self._resolve_target_chats(target_chats, chat_type=chat_type)
+        if not sessions:
             return {
                 "meta": {
                     "query": q_clean,
@@ -697,8 +894,8 @@ class QueryEngine:
             }
 
         since_epoch = parse_since_to_epoch(since_str, time.time()) if since_str else None
-        grp_map = {g["chat_id"]: clean_unicode_display_name(g["group_name"]) or "未命名微信群" for g in groups}
-        grp_placeholders = ",".join("?" for _ in grp_map)
+        sess_map = {s["chat_id"]: s for s in sessions}
+        sess_placeholders = ",".join("?" for _ in sess_map)
         excl_placeholders = ",".join("?" for _ in EXCLUDED_MSG_TYPES)
 
         ctime_col = (
@@ -707,10 +904,10 @@ class QueryEngine:
             else "create_time"
         )
         where_clauses = [
-            f"chat_id IN ({grp_placeholders})",
+            f"chat_id IN ({sess_placeholders})",
             f"local_type NOT IN ({excl_placeholders})",
         ]
-        params: list[Any] = [*grp_map.keys(), *EXCLUDED_MSG_TYPES]
+        params: list[Any] = [*sess_map.keys(), *EXCLUDED_MSG_TYPES]
         if since_epoch is not None:
             where_clauses.append(f"{ctime_col} >= ?")
             params.append(int(since_epoch))
@@ -789,6 +986,7 @@ class QueryEngine:
                 continue
 
             chat_id = row["chat_id"]
+            sess_info = sess_map[chat_id]
             hit_id = msg_obj["msg_id"]
             before_msgs: list[dict[str, Any]] = []
             after_msgs: list[dict[str, Any]] = []
@@ -828,7 +1026,9 @@ class QueryEngine:
             matches.append(
                 {
                     "chat_id": chat_id,
-                    "group_name": grp_map[chat_id],
+                    "chat_name": sess_info["chat_name"],
+                    "group_name": sess_info["chat_name"],
+                    "chat_type": sess_info["chat_type"],
                     "matched_message": msg_obj,
                     "context_before": before_msgs,
                     "context_after": after_msgs,

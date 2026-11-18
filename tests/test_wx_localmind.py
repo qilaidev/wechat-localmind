@@ -431,25 +431,92 @@ class TestWXLocalMindSuite(unittest.TestCase):
         grps_all = json.loads(out)["groups"]
         self.assertEqual(len(grps_all), 2)
 
-    def test_04_private_chat_and_blocked_group_isolation(self) -> None:
-        """Verify 100% physical blocking of 1-on-1 private chats (wxid_*) and blacklisted groups (Exit Code 3)."""
-        code, _, err = self._run_cli(["fetch", "--chats", "wxid_alice", "--format", "json"])
-        self.assertEqual(code, EXIT_POLICY_DENIED)
-        err_json = json.loads(err)
-        self.assertEqual(err_json["error_code"], "PRIVATE_SESSION_BLOCKED")
+    def test_04_chat_scope_alias_and_policy_filtering(self) -> None:
+        """Verify 1-on-1 direct chats (and alias lookup) work by default, and block/set-scope enforce Exit Code 3."""
+        # 1. `chats` listing supports --type all | direct | group
+        code_all, out_all, err_all = self._run_cli(["chats", "--type", "all", "--format", "json"])
+        self.assertEqual(code_all, EXIT_SUCCESS, err_all)
+        chats_all = json.loads(out_all)["chats"]
+        self.assertEqual({c["chat_id"] for c in chats_all}, {"10001@chatroom", "wxid_alice"})
 
+        code_dir, out_dir, err_dir = self._run_cli(["chats", "--type", "direct", "--format", "json"])
+        self.assertEqual(code_dir, EXIT_SUCCESS, err_dir)
+        chats_dir = json.loads(out_dir)["chats"]
+        self.assertEqual(len(chats_dir), 1)
+        self.assertEqual(chats_dir[0]["chat_id"], "wxid_alice")
+        self.assertEqual(chats_dir[0]["chat_type"], "direct")
+        self.assertEqual(chats_dir[0]["chat_name"], "李总监(采购)")
+
+        code_grp, out_grp, err_grp = self._run_cli(["chats", "--type", "group", "--format", "json"])
+        self.assertEqual(code_grp, EXIT_SUCCESS, err_grp)
+        chats_grp = json.loads(out_grp)["chats"]
+        self.assertEqual([c["chat_id"] for c in chats_grp], ["10001@chatroom"])
+
+        # 2. Fetching 1-on-1 direct chat by wxid and by custom alias succeeds by default
+        code_dm, out_dm, err_dm = self._run_cli(["fetch", "--chats", "wxid_alice", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_dm, EXIT_SUCCESS, err_dm)
+        dm_payload = json.loads(out_dm)
+        self.assertEqual(len(dm_payload["chats"]), 1)
+        self.assertEqual(dm_payload["chats"][0]["chat_id"], "wxid_alice")
+        self.assertEqual(dm_payload["chats"][0]["chat_type"], "direct")
+        self.assertEqual(dm_payload["chats"][0]["messages"][0]["sender_name"], "李总监(采购)")
+        self.assertIn("银行卡密码", dm_payload["chats"][0]["messages"][0]["text"])
+
+        code_al, out_al, err_al = self._run_cli(["fetch", "--chats", "alice88", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_al, EXIT_SUCCESS, err_al)
+        al_payload = json.loads(out_al)
+        self.assertEqual(al_payload["chats"][0]["chat_id"], "wxid_alice")
+        self.assertEqual(len(al_payload["chats"][0]["messages"]), 1)
+
+        # 3. Blacklisted group is still blocked with CHAT_BLOCKED_BY_POLICY
         code, _, err = self._run_cli(["fetch", "--chats", "99999@chatroom", "--format", "json"])
         self.assertEqual(code, EXIT_POLICY_DENIED)
         err_json = json.loads(err)
-        self.assertEqual(err_json["error_code"], "GROUP_BLOCKED_BY_POLICY")
+        self.assertEqual(err_json["error_code"], "CHAT_BLOCKED_BY_POLICY")
+
+        # 4. `config block wxid_alice` blocks both wxid_alice and its alias alice88
+        code_blk, _, err_blk = self._run_cli(["config", "block", "wxid_alice"])
+        self.assertEqual(code_blk, EXIT_SUCCESS, err_blk)
+
+        code_b1, _, err_b1 = self._run_cli(["fetch", "--chats", "wxid_alice", "--format", "json"])
+        self.assertEqual(code_b1, EXIT_POLICY_DENIED)
+        self.assertEqual(json.loads(err_b1)["error_code"], "CHAT_BLOCKED_BY_POLICY")
+
+        code_b2, _, err_b2 = self._run_cli(["fetch", "--chats", "alice88", "--format", "json"])
+        self.assertEqual(code_b2, EXIT_POLICY_DENIED)
+        self.assertEqual(json.loads(err_b2)["error_code"], "CHAT_BLOCKED_BY_POLICY")
+
+        # 5. `config unblock wxid_alice` + `config set-scope groups` enforces CHAT_SCOPE_DENIED on direct chats
+        self.assertEqual(self._run_cli(["config", "unblock", "wxid_alice"])[0], EXIT_SUCCESS)
+        self.assertEqual(self._run_cli(["config", "set-scope", "groups"])[0], EXIT_SUCCESS)
+
+        code_sc, _, err_sc = self._run_cli(["fetch", "--chats", "wxid_alice", "--format", "json"])
+        self.assertEqual(code_sc, EXIT_POLICY_DENIED)
+        self.assertEqual(json.loads(err_sc)["error_code"], "CHAT_SCOPE_DENIED")
 
     def test_05_fetch_4tier_names_quotes_mentions_and_revoked_filtering(self) -> None:
-        """Verify 4-tier real-name resolution, quote chain (#1), [@我(张工)], ack folding, and revoked removal."""
+        """Verify full-account ALL_ALLOWED / ALL_GROUPS / ALL_DIRECT, 4-tier names, quotes, mentions, and revoked removal."""
+        # ALL_ALLOWED returns both allowed group (10001@chatroom) and direct DM (wxid_alice)
         code, out, err = self._run_cli(["fetch", "--chats", "ALL_ALLOWED", "--since", "24h", "--format", "json"])
         self.assertEqual(code, EXIT_SUCCESS, err)
         data = json.loads(out)
-        self.assertEqual(len(data["chats"]), 1)
-        msgs = data["chats"][0]["messages"]
+        self.assertEqual(len(data["chats"]), 2)
+        by_cid = {c["chat_id"]: c for c in data["chats"]}
+        self.assertIn("10001@chatroom", by_cid)
+        self.assertIn("wxid_alice", by_cid)
+        self.assertEqual(by_cid["wxid_alice"]["messages"][0]["sender_name"], "李总监(采购)")
+
+        # ALL_DIRECT returns only 1-on-1 chats
+        code_d, out_d, err_d = self._run_cli(["fetch", "--chats", "ALL_DIRECT", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_d, EXIT_SUCCESS, err_d)
+        self.assertEqual([c["chat_id"] for c in json.loads(out_d)["chats"]], ["wxid_alice"])
+
+        # ALL_GROUPS returns the 9 valid messages in 10001@chatroom
+        code_g, out_g, err_g = self._run_cli(["fetch", "--chats", "ALL_GROUPS", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_g, EXIT_SUCCESS, err_g)
+        data_g = json.loads(out_g)
+        self.assertEqual(len(data_g["chats"]), 1)
+        msgs = data_g["chats"][0]["messages"]
 
         # 10 raw rows in 10001@chatroom, minus 1 revoked (#10) = 9 valid messages
         self.assertEqual(len(msgs), 9)
@@ -468,8 +535,8 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertTrue(msgs[2]["mentions_me"])
         self.assertIn("[@我(张工)]", msgs[2]["text"])
 
-        # Tier 4: Unknown wxid fallback ("微信群友(9876)") + ack noise
-        self.assertEqual(msgs[3]["sender_name"], "微信群友(9876)")
+        # Tier 4: Unknown wxid fallback ("微信用户(9876)") + ack noise
+        self.assertEqual(msgs[3]["sender_name"], "微信用户(9876)")
         self.assertTrue(msgs[3]["is_ack_noise"])
 
         # Punctuation name disambiguation (".(#unct)")
@@ -481,7 +548,7 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertTrue(msgs[5]["is_from_me"])
 
         # Verify Markdown rendering folds consecutive ack noise (#4 and #5) and marks 15s voice warning
-        code_md, out_md, _ = self._run_cli(["fetch", "--chats", "ALL_ALLOWED", "--since", "24h", "--format", "md"])
+        code_md, out_md, _ = self._run_cli(["fetch", "--chats", "ALL_GROUPS", "--since", "24h", "--format", "md"])
         self.assertEqual(code_md, EXIT_SUCCESS)
         self.assertIn("系统折叠:", out_md)
         self.assertIn("⚠️ 语音消息未转写: 15秒", out_md)
@@ -507,13 +574,22 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertEqual(meta["warnings"][0]["code"], "CURSOR_RESET_FALLBACK")
 
     def test_07_export_media_and_dat_xor_image_decryption(self) -> None:
-        """Verify `export-media` automatically decrypts WeChat `.dat` XOR image to `.jpg` and exports PDF."""
-        # First verify that exporting a message from a blocked group (msg_id=7 in 99999@chatroom) is rejected with Exit Code 3
-        code_blk, _, _ = self._run_cli(["export-media", "--msg-ids", "7", "--format", "json"])
+        """Verify `export-media` automatically decrypts WeChat `.dat` XOR image to `.jpg`, exports PDF, and supports 1-on-1 DMs."""
+        # Look up blocked group's latest_msg_id dynamically and verify export is rejected with Exit Code 3
+        code_grps, out_grps, err_grps = self._run_cli(["groups", "--include-blocked", "--format", "json"])
+        self.assertEqual(code_grps, EXIT_SUCCESS, err_grps)
+        blocked_grp = [g for g in json.loads(out_grps)["groups"] if g["chat_id"] == "99999@chatroom"][0]
+        code_blk, _, _ = self._run_cli(["export-media", "--msg-ids", str(blocked_grp["latest_msg_id"]), "--format", "json"])
         self.assertEqual(code_blk, EXIT_POLICY_DENIED)
 
-        # In 10001@chatroom, msg_id=8 is the XOR-encrypted .dat image, msg_id=9 is the PDF
-        code, out, err = self._run_cli(["export-media", "--msg-ids", "8,9", "--format", "json"])
+        # Dynamically look up the .dat image and PDF msg_ids in 10001@chatroom
+        code_f, out_f, err_f = self._run_cli(["fetch", "--chats", "10001@chatroom", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_f, EXIT_SUCCESS, err_f)
+        work_msgs = json.loads(out_f)["chats"][0]["messages"]
+        img_msg_id = [m["msg_id"] for m in work_msgs if m.get("media") and m["media"]["media_type"] == "image"][0]
+        pdf_msg_id = [m["msg_id"] for m in work_msgs if m.get("media") and m["media"]["media_type"] == "document"][0]
+
+        code, out, err = self._run_cli(["export-media", "--msg-ids", f"{img_msg_id},{pdf_msg_id}", "--format", "json"])
         self.assertEqual(code, EXIT_SUCCESS, err)
         exported = json.loads(out)["exported"]
         self.assertEqual(len(exported), 2)
@@ -530,12 +606,60 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertEqual(pdf_item["media_type"], "document")
         self.assertTrue(pdf_item["exported_path"].endswith(".pdf"))
 
+        # Add a PNG .dat image attachment to 1-on-1 DM (wxid_alice) and verify export-media works for direct chats
+        raw_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x12\x34" * 12
+        (self.media_dir / "dm_receipt.dat").write_bytes(bytes(b ^ 0x3C for b in raw_png))
+        plain_msg0 = self.tmp_dir / "plain_message_0.db"
+        tbl_private = f"Msg_{_md5('wxid_alice')}"
+        m_conn = sqlite3.connect(str(plain_msg0))
+        m_conn.execute(
+            f"INSERT INTO {tbl_private} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                2,
+                70002,
+                3,
+                self.now_ts - 50,
+                1,
+                0,
+                '<msg><img hdlength="32" length="32" /></msg>',
+                None,
+                _encode_protobuf_field_string(2, "attach/dm_receipt.dat"),
+            ),
+        )
+        m_conn.commit()
+        m_conn.close()
+        encrypt_sqlite_to_sqlcipher(plain_msg0, self.msg_dir / "message_0.db", self.key_msg0, cipher_version=4)
+
+        code_dm, out_dm, err_dm = self._run_cli(["fetch", "--fresh", "--chats", "wxid_alice", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_dm, EXIT_SUCCESS, err_dm)
+        dm_msgs = json.loads(out_dm)["chats"][0]["messages"]
+        dm_img_id = [m["msg_id"] for m in dm_msgs if m.get("media") and m["media"]["media_type"] == "image"][0]
+
+        code_exp_dm, out_exp_dm, err_exp_dm = self._run_cli(["export-media", "--msg-ids", str(dm_img_id), "--format", "json"])
+        self.assertEqual(code_exp_dm, EXIT_SUCCESS, err_exp_dm)
+        dm_exp = json.loads(out_exp_dm)["exported"][0]
+        self.assertEqual(dm_exp["chat_id"], "wxid_alice")
+        self.assertEqual(dm_exp["chat_type"], "direct")
+        self.assertEqual(dm_exp["mime_type"], "image/png")
+        self.assertEqual(dm_exp["xor_key_byte"], "0x3c")
+        self.assertTrue(dm_exp["exported_path"].endswith(".png"))
+        self.assertEqual(Path(dm_exp["exported_path"]).read_bytes(), raw_png)
+
     def test_08_search_and_mcp_server(self) -> None:
-        """Verify cross-group keyword search and JSON-RPC 2.0 MCP Stdio server."""
+        """Verify cross-chat keyword search and JSON-RPC 2.0 MCP Stdio server (5 tools)."""
         code, out, _ = self._run_cli(["search", "--query", "报价单", "--context", "1", "--format", "json"])
         self.assertEqual(code, EXIT_SUCCESS)
         s_res = json.loads(out)
         self.assertGreaterEqual(s_res["meta"]["match_count"], 2)
+
+        # Also verify searching inside 1-on-1 direct chat
+        code_dm_s, out_dm_s, _ = self._run_cli(
+            ["search", "--query", "银行卡密码", "--type", "direct", "--format", "json"]
+        )
+        self.assertEqual(code_dm_s, EXIT_SUCCESS)
+        dm_s_res = json.loads(out_dm_s)
+        self.assertEqual(dm_s_res["meta"]["match_count"], 1)
+        self.assertEqual(dm_s_res["matches"][0]["chat_id"], "wxid_alice")
 
         # Test MCP Server over stdin/stdout
         mcp_reqs = "\n".join(
@@ -548,8 +672,8 @@ class TestWXLocalMindSuite(unittest.TestCase):
                         "id": 3,
                         "method": "tools/call",
                         "params": {
-                            "name": "wechat_list_groups",
-                            "arguments": {"format": "json"},
+                            "name": "wechat_list_chats",
+                            "arguments": {"chat_type": "all", "format": "json"},
                         },
                     }
                 ),
@@ -563,8 +687,10 @@ class TestWXLocalMindSuite(unittest.TestCase):
         lines = [json.loads(line) for line in out_buf.getvalue().strip().splitlines()]
         self.assertEqual(len(lines), 3)
         self.assertEqual(lines[0]["result"]["serverInfo"]["name"], "wechat-localmind")
-        self.assertEqual(len(lines[1]["result"]["tools"]), 4)
+        self.assertEqual(len(lines[1]["result"]["tools"]), 5)
         self.assertFalse(lines[2]["result"]["isError"])
+        mcp_chats = json.loads(lines[2]["result"]["content"][0]["text"])["chats"]
+        self.assertEqual({c["chat_id"] for c in mcp_chats}, {"10001@chatroom", "wxid_alice"})
 
     def test_09_zstd_native_commoncrypto_and_snr_filtering(self) -> None:
         """Verify zstd decompression, corrupt zstd mojibake guard, vectorized PNG XOR, and SNR noise filtering."""
@@ -606,8 +732,8 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertEqual(key_used, 0xA5)
         self.assertEqual(decoded, raw_png)
 
-    def test_10_privacy_staging_purge_contact_pruning_and_permissions(self) -> None:
-        """Verify decrypted_raw staging is purged, non-group private contacts are pruned, and file perms are 0600/0700."""
+    def test_10_privacy_staging_purge_contacts_preservation_and_permissions(self) -> None:
+        """Verify decrypted_raw staging is purged, all contacts (including private friends) are preserved in v2.0, and file perms are 0600/0700."""
         plain_contact = self.tmp_dir / "plain_contact.db"
         c_conn = sqlite3.connect(str(plain_contact))
         c_conn.execute(
@@ -623,19 +749,19 @@ class TestWXLocalMindSuite(unittest.TestCase):
             cipher_version=4,
         )
 
-        code, _, err = self._run_cli(["groups", "--fresh", "--format", "json"])
+        code, _, err = self._run_cli(["chats", "--fresh", "--format", "json"])
         self.assertEqual(code, EXIT_SUCCESS, err)
 
         # 1. `snapshot/decrypted_raw/` must never remain on disk after snapshot build
         self.assertFalse((self.snapshot_dir / "decrypted_raw").exists())
 
-        # 2. Pure 1-on-1 private contacts (not in any group) must be pruned from unified snapshot
+        # 2. All contacts (including 1-on-1 private friends) are preserved in unified snapshot `wx_contacts`
         snap_db = self.snapshot_dir / "WeChat_Unified_snapshot.sqlite"
         self.assertTrue(snap_db.is_file())
         s_conn = sqlite3.connect(str(snap_db))
         usernames = {r[0] for r in s_conn.execute("SELECT username FROM wx_contacts").fetchall()}
         s_conn.close()
-        self.assertNotIn("wxid_pure_private_friend", usernames)
+        self.assertIn("wxid_pure_private_friend", usernames)
         self.assertIn("10001@chatroom", usernames)
         self.assertIn("wxid_alice", usernames)
 
@@ -715,7 +841,7 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertEqual(code, EXIT_SUCCESS, err)
         init_payload = json.loads(out)
         init_latest_id = init_payload["meta"]["global_latest_msg_id"]
-        self.assertEqual(init_latest_id, 11)
+        self.assertEqual(init_latest_id, 12)
         orig_id_by_text = {m["text"]: m["msg_id"] for m in init_payload["chats"][0]["messages"]}
 
         plain_msg0 = self.tmp_dir / "plain_message_0.db"
@@ -1009,11 +1135,13 @@ class TestWXLocalMindSuite(unittest.TestCase):
         self.assertEqual(len(resps), 5)
 
         tools = resps[0]["result"]["tools"]
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 5)
         for t in tools:
             self.assertTrue(t["annotations"]["readOnlyHint"])
             self.assertFalse(t["annotations"]["destructiveHint"])
         by_name = {t["name"]: t for t in tools}
+        self.assertIn("wechat_list_chats", by_name)
+        self.assertIn("chat_type", by_name["wechat_list_chats"]["inputSchema"]["properties"])
         self.assertIn("fresh", by_name["wechat_search_messages"]["inputSchema"]["properties"])
         self.assertIn("fresh", by_name["wechat_export_media"]["inputSchema"]["properties"])
 
@@ -1037,6 +1165,111 @@ class TestWXLocalMindSuite(unittest.TestCase):
         ):
             win_dir = _resolve_default_app_support_dir()
             self.assertEqual(win_dir.name, "WeChat-LocalMind")
+
+    def test_17_official_account_and_filehelper_extraction(self) -> None:
+        """Verify `gh_*` official accounts, `filehelper` built-in session, `ALL_OFFICIAL`, and `set-scope official`."""
+        plain_contact = self.tmp_dir / "plain_contact.db"
+        c_conn = sqlite3.connect(str(plain_contact))
+        c_conn.execute(
+            "INSERT INTO contact VALUES (?, ?, ?, ?, ?)",
+            (8, "gh_technews001", "科技前沿观察", "", ""),
+        )
+        c_conn.commit()
+        c_conn.close()
+        encrypt_sqlite_to_sqlcipher(plain_contact, self.contact_dir / "contact.db", self.key_contact, cipher_version=4)
+
+        plain_msg0 = self.tmp_dir / "plain_message_0.db"
+        tbl_gh_named = f"Msg_{_md5('gh_technews001')}"
+        tbl_gh_anon = f"Msg_{_md5('gh_nocontact9999')}"
+        tbl_fh = f"Msg_{_md5('filehelper')}"
+        m_conn = sqlite3.connect(str(plain_msg0))
+        m_conn.executescript(
+            f"""
+            CREATE TABLE {tbl_gh_named} (
+                local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, real_sender_id INTEGER, is_send INTEGER,
+                message_content TEXT, compress_content BLOB, packed_info_data BLOB
+            );
+            CREATE TABLE {tbl_gh_anon} (
+                local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, real_sender_id INTEGER, is_send INTEGER,
+                message_content TEXT, compress_content BLOB, packed_info_data BLOB
+            );
+            CREATE TABLE {tbl_fh} (
+                local_id INTEGER PRIMARY KEY, server_id INTEGER, local_type INTEGER,
+                create_time INTEGER, real_sender_id INTEGER, is_send INTEGER,
+                message_content TEXT, compress_content BLOB, packed_info_data BLOB
+            );
+            """
+        )
+        m_conn.execute("INSERT INTO Name2Id (user_name) VALUES (?)", ("gh_technews001",))
+        m_conn.execute("INSERT INTO Name2Id (user_name) VALUES (?)", ("gh_nocontact9999",))
+        m_conn.execute(
+            f"INSERT INTO {tbl_gh_named} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                60001,
+                49,
+                self.now_ts - 80,
+                7,
+                0,
+                "<msg><appmsg><title>2026端侧AI芯片架构深度报告</title><type>5</type><url>https://example.com/ai-chip</url></appmsg></msg>",
+                None,
+                None,
+            ),
+        )
+        m_conn.execute(
+            f"INSERT INTO {tbl_gh_anon} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 60002, 1, self.now_ts - 70, 8, 0, "服务号推送通知", None, None),
+        )
+        m_conn.execute(
+            f"INSERT INTO {tbl_fh} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (1, 60003, 1, self.now_ts - 60, 6, 1, "备忘：下午三点对账", None, None),
+        )
+        m_conn.commit()
+        m_conn.close()
+        encrypt_sqlite_to_sqlcipher(plain_msg0, self.msg_dir / "message_0.db", self.key_msg0, cipher_version=4)
+
+        # 1. `chats --type official` lists both gh_* official accounts with resolved & fallback names
+        code_c, out_c, err_c = self._run_cli(["chats", "--fresh", "--type", "official", "--format", "json"])
+        self.assertEqual(code_c, EXIT_SUCCESS, err_c)
+        off_chats = {c["chat_id"]: c for c in json.loads(out_c)["chats"]}
+        self.assertEqual(set(off_chats.keys()), {"gh_technews001", "gh_nocontact9999"})
+        self.assertEqual(off_chats["gh_technews001"]["chat_name"], "科技前沿观察")
+        self.assertEqual(off_chats["gh_nocontact9999"]["chat_name"], "公众号(9999)")
+
+        # 2. `fetch --chats ALL_OFFICIAL` extracts official account feeds
+        code_fo, out_fo, err_fo = self._run_cli(["fetch", "--chats", "ALL_OFFICIAL", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_fo, EXIT_SUCCESS, err_fo)
+        fo_by_id = {c["chat_id"]: c for c in json.loads(out_fo)["chats"]}
+        self.assertIn("gh_technews001", fo_by_id)
+        self.assertIn("2026端侧AI芯片架构深度报告", fo_by_id["gh_technews001"]["messages"][0]["text"])
+        self.assertEqual(fo_by_id["gh_nocontact9999"]["messages"][0]["sender_name"], "公众号(9999)")
+
+        # 3. `fetch --chats filehelper` resolves built-in "文件传输助手"
+        code_fh, out_fh, err_fh = self._run_cli(["fetch", "--chats", "filehelper", "--since", "24h", "--format", "json"])
+        self.assertEqual(code_fh, EXIT_SUCCESS, err_fh)
+        fh_chat = json.loads(out_fh)["chats"][0]
+        self.assertEqual(fh_chat["chat_name"], "文件传输助手")
+        self.assertEqual(fh_chat["chat_type"], "direct")
+        self.assertEqual(fh_chat["messages"][0]["text"], "备忘：下午三点对账")
+
+        # 4. `search --type official` scopes search exclusively to official accounts
+        code_so, out_so, err_so = self._run_cli(["search", "--query", "芯片", "--type", "official", "--format", "json"])
+        self.assertEqual(code_so, EXIT_SUCCESS, err_so)
+        so_res = json.loads(out_so)
+        self.assertEqual(so_res["meta"]["match_count"], 1)
+        self.assertEqual(so_res["matches"][0]["chat_id"], "gh_technews001")
+
+        # 5. `config set-scope official` permits gh_* while denying wxid_alice and 10001@chatroom with CHAT_SCOPE_DENIED
+        self.assertEqual(self._run_cli(["config", "set-scope", "official"])[0], EXIT_SUCCESS)
+        self.assertEqual(self._run_cli(["fetch", "--chats", "gh_technews001", "--format", "json"])[0], EXIT_SUCCESS)
+        code_dm_den, _, err_dm_den = self._run_cli(["fetch", "--chats", "wxid_alice", "--format", "json"])
+        self.assertEqual(code_dm_den, EXIT_POLICY_DENIED)
+        self.assertEqual(json.loads(err_dm_den)["error_code"], "CHAT_SCOPE_DENIED")
+        code_grp_den, _, err_grp_den = self._run_cli(["fetch", "--chats", "10001@chatroom", "--format", "json"])
+        self.assertEqual(code_grp_den, EXIT_POLICY_DENIED)
+        self.assertEqual(json.loads(err_grp_den)["error_code"], "CHAT_SCOPE_DENIED")
 
 
 if __name__ == "__main__":

@@ -16,8 +16,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import AppConfig
+from .cleaner import clean_unicode_display_name, format_fallback_sender_name
+from .config import AppConfig, classify_wx_chat_id
 from .constants import (
+    BUILTIN_WECHAT_NAMES,
     CANDIDATE_WECHAT_ROOTS,
     DEFAULT_MAC_WECHAT4_FILES_DIR,
     DEFAULT_WX_DATA_DIR,
@@ -29,8 +31,22 @@ from .errors import EnvOrPermissionError
 from .protobuf_parser import get_zstd_backend_name, parse_wechat_message_payload
 
 MSG_TABLE_RE = re.compile(r"^(Msg|Chat)_([0-9a-fA-F]{32})$", re.IGNORECASE)
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 RECENT_RECALL_RECHECK_WINDOW = 25
+
+
+def _seed_builtin_md5_map(my_account_wxid: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for bid in (
+        *BUILTIN_WECHAT_NAMES.keys(),
+        "officialaccounts",
+        "brandsessionholder",
+        "brandservicesessionholder",
+    ):
+        out[hashlib.md5(bid.encode("utf-8")).hexdigest().lower()] = bid
+    if my_account_wxid:
+        out[hashlib.md5(my_account_wxid.encode("utf-8")).hexdigest().lower()] = my_account_wxid
+    return out
 
 
 @dataclass
@@ -543,7 +559,7 @@ class SnapshotManager:
         return dst_db
 
     def _purge_raw_decrypted_staging(self) -> None:
-        """Unconditionally remove single-DB decrypted files so zero 1-on-1 private chats persist on disk."""
+        """Unconditionally remove temporary per-shard decrypted staging files after unified snapshot assembly."""
         if self.raw_decrypted_dir.exists():
             shutil.rmtree(self.raw_decrypted_dir, ignore_errors=True)
 
@@ -678,12 +694,17 @@ class SnapshotManager:
                 group_nickname TEXT,
                 PRIMARY KEY (chat_id, member_wxid)
             );
-            CREATE TABLE wx_groups (
+            CREATE TABLE wx_chats (
                 chat_id TEXT PRIMARY KEY,
-                group_name TEXT,
+                chat_name TEXT,
+                chat_type TEXT DEFAULT 'direct',
                 member_count INTEGER DEFAULT 0,
                 last_active_epoch INTEGER DEFAULT 0
             );
+            CREATE VIEW wx_groups AS
+            SELECT chat_id, chat_name AS group_name, member_count, last_active_epoch
+            FROM wx_chats
+            WHERE chat_type = 'group';
             CREATE TABLE wx_messages (
                 msg_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 shard_name TEXT,
@@ -739,69 +760,82 @@ class SnapshotManager:
         fts_mode: str = "rebuild",
         fts_after_msg_id: int = 0,
     ) -> None:
-        """Refresh `wx_groups` metadata, prune non-group 1-on-1 contacts, and sync `wx_messages_fts`."""
-        u_cur.execute(
-            """
-            INSERT INTO wx_groups (chat_id, group_name, member_count, last_active_epoch)
-            SELECT
-                c.username,
-                COALESCE(NULLIF(TRIM(c.remark), ''), NULLIF(TRIM(c.nick_name), ''), '未命名微信群'),
-                (SELECT COUNT(*) FROM wx_group_members gm WHERE gm.chat_id = c.username),
-                0
-            FROM wx_contacts c
-            WHERE c.username LIKE '%@chatroom'
-            ON CONFLICT(chat_id) DO UPDATE SET
-                group_name = CASE
-                    WHEN excluded.group_name != '未命名微信群' THEN excluded.group_name
-                    ELSE wx_groups.group_name
-                END
-            """
-        )
-        u_cur.execute(
-            """
-            INSERT OR IGNORE INTO wx_groups (chat_id, group_name, member_count, last_active_epoch)
-            SELECT DISTINCT
-                m.chat_id,
-                '未命名微信群',
-                (SELECT COUNT(*) FROM wx_group_members gm WHERE gm.chat_id = m.chat_id),
-                MAX(m.create_time)
-            FROM wx_messages m
-            WHERE m.chat_id LIKE '%@chatroom'
-            GROUP BY m.chat_id
-            """
-        )
-        u_cur.execute(
-            """
-            UPDATE wx_groups
-            SET
-                member_count = CASE
-                    WHEN (SELECT COUNT(*) FROM wx_group_members gm WHERE gm.chat_id = wx_groups.chat_id) > member_count
-                    THEN (SELECT COUNT(*) FROM wx_group_members gm WHERE gm.chat_id = wx_groups.chat_id)
-                    ELSE member_count
-                END,
-                last_active_epoch = COALESCE(
-                    (SELECT MAX(m.create_time) FROM wx_messages m WHERE m.chat_id = wx_groups.chat_id),
-                    0
-                )
-            """
-        )
+        """Refresh `wx_chats` metadata across all session types, keep all `wx_contacts`, and sync `wx_messages_fts`."""
+        u_cur.execute("SELECT username, nick_name, remark FROM wx_contacts")
+        contact_names: dict[str, str] = {}
+        group_contact_ids: set[str] = set()
+        for row in u_cur.fetchall():
+            uname = (row[0] or "").strip()
+            if not uname:
+                continue
+            nick = clean_unicode_display_name(row[1])
+            rem = clean_unicode_display_name(row[2])
+            best = rem or nick
+            if best:
+                contact_names[uname] = best
+            if AppConfig.is_group_chat_id(uname):
+                group_contact_ids.add(uname)
 
-        # Privacy redline: purge 1-on-1 private contacts who are neither in any group nor self
+        u_cur.execute(
+            "SELECT chat_id, COUNT(*) FROM wx_group_members GROUP BY chat_id"
+        )
+        grp_member_counts = {str(r[0]): int(r[1] or 0) for r in u_cur.fetchall() if r[0]}
+
+        u_cur.execute(
+            "SELECT chat_id, COALESCE(MAX(create_time), 0) FROM wx_messages GROUP BY chat_id"
+        )
+        msg_last_epochs = {str(r[0]): int(r[1] or 0) for r in u_cur.fetchall() if r[0]}
+
+        all_session_ids = group_contact_ids | set(msg_last_epochs.keys())
+        for cid in all_session_ids:
+            ctype = classify_wx_chat_id(cid)
+            if ctype == "unknown":
+                continue
+            if cid == my_account_wxid and cid in contact_names:
+                cname = contact_names[cid]
+            elif cid in contact_names:
+                cname = contact_names[cid]
+            elif cid in BUILTIN_WECHAT_NAMES:
+                cname = BUILTIN_WECHAT_NAMES[cid]
+            elif ctype == "group":
+                cname = "未命名微信群"
+            else:
+                cname = format_fallback_sender_name(cid)
+
+            if ctype == "group":
+                m_cnt = grp_member_counts.get(cid, 0)
+            elif ctype == "direct":
+                m_cnt = 1 if cid in ("filehelper", my_account_wxid) else 2
+            else:
+                m_cnt = 0
+
+            last_ep = msg_last_epochs.get(cid, 0)
+            u_cur.execute(
+                """
+                INSERT INTO wx_chats (chat_id, chat_name, chat_type, member_count, last_active_epoch)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    chat_name = CASE
+                        WHEN excluded.chat_name NOT IN ('未命名微信群', '未知联系人') THEN excluded.chat_name
+                        ELSE wx_chats.chat_name
+                    END,
+                    chat_type = excluded.chat_type,
+                    member_count = CASE
+                        WHEN excluded.member_count > wx_chats.member_count THEN excluded.member_count
+                        ELSE wx_chats.member_count
+                    END,
+                    last_active_epoch = excluded.last_active_epoch
+                """,
+                (cid, cname, ctype, m_cnt, last_ep),
+            )
+
+        # Remove stale non-contact sessions whose messages were completely cleared
         u_cur.execute(
             """
-            DELETE FROM wx_contacts
-            WHERE is_group = 0
-              AND username NOT IN (
-                  SELECT DISTINCT member_wxid FROM wx_group_members
-                  WHERE member_wxid IS NOT NULL AND member_wxid != ''
-              )
-              AND username NOT IN (
-                  SELECT DISTINCT sender_wxid FROM wx_messages
-                  WHERE sender_wxid IS NOT NULL AND sender_wxid != ''
-              )
-              AND username != ?
-            """,
-            (my_account_wxid or "",),
+            DELETE FROM wx_chats
+            WHERE chat_type != 'group'
+              AND chat_id NOT IN (SELECT DISTINCT chat_id FROM wx_messages)
+            """
         )
 
         # Sync optional FTS5 trigram index
@@ -828,7 +862,7 @@ class SnapshotManager:
         u_cur = u_conn.cursor()
         self._init_unified_schema(u_cur)
 
-        md5_to_chat_id: dict[str, str] = {}
+        md5_to_chat_id: dict[str, str] = _seed_builtin_md5_map(acc.wxid)
 
         try:
             if acc.contact_db and acc.contact_db.is_file():
@@ -960,13 +994,13 @@ class SnapshotManager:
                 (r[0], r[1]): (int(r[2] or 0), int(r[3] or 0)) for r in u_cur.fetchall()
             }
 
-            # Seed md5 -> group chat_id mapping from already-known groups so unchanged contact.db need not be re-read
-            md5_to_chat_id: dict[str, str] = {}
-            u_cur.execute("SELECT chat_id FROM wx_groups")
+            # Seed md5 -> chat_id mapping from all known sessions and contacts so unchanged contact.db need not be re-read
+            md5_to_chat_id: dict[str, str] = _seed_builtin_md5_map(acc.wxid)
+            u_cur.execute("SELECT chat_id FROM wx_chats")
             for (cid,) in u_cur.fetchall():
-                if cid:
+                if cid and not str(cid).startswith("unknown_"):
                     md5_to_chat_id[md5_hex(cid)] = cid
-            u_cur.execute("SELECT username FROM wx_contacts WHERE is_group = 1")
+            u_cur.execute("SELECT username FROM wx_contacts")
             for (cid,) in u_cur.fetchall():
                 if cid:
                     md5_to_chat_id[md5_hex(cid)] = cid
@@ -1100,9 +1134,7 @@ class SnapshotManager:
                     m = MSG_TABLE_RE.match(tbl)
                     if not m:
                         continue
-                    cid = local_md5.get(m.group(2).lower())
-                    if not cid or not cid.endswith("@chatroom"):
-                        continue
+                    cid = local_md5.get(m.group(2).lower()) or f"unknown_{m.group(2).lower()[:12]}"
                     prev = prev_watermarks.get((msg_db_path.name, cid))
                     if prev is None:
                         continue
@@ -1147,7 +1179,7 @@ class SnapshotManager:
                     n = (row["n"] or "").strip()
                     r = (row["r"] or "").strip()
                     a = (row["a"] or "").strip()
-                    is_grp = 1 if u.endswith("@chatroom") else 0
+                    is_grp = 1 if AppConfig.is_group_chat_id(u) else 0
                     md5_to_chat_id[md5_hex(u)] = u
                     u_cur.execute(
                         "INSERT OR REPLACE INTO wx_contacts (username, nick_name, remark, alias, is_group) VALUES (?, ?, ?, ?, ?)",
@@ -1164,7 +1196,7 @@ class SnapshotManager:
                         if not u:
                             continue
                         md5_to_chat_id[md5_hex(u)] = u
-                        is_grp = 1 if u.endswith("@chatroom") else 0
+                        is_grp = 1 if AppConfig.is_group_chat_id(u) else 0
                         u_cur.execute(
                             "INSERT OR REPLACE INTO wx_contacts (username, nick_name, remark, alias, is_group) VALUES (?, ?, ?, ?, ?)",
                             (u, (row["n"] or "").strip(), (row["r"] or "").strip(), (row["a"] or "").strip(), is_grp),
@@ -1185,7 +1217,7 @@ class SnapshotManager:
                         if not u:
                             continue
                         md5_to_chat_id[md5_hex(u)] = u
-                        is_grp = 1 if u.endswith("@chatroom") else 0
+                        is_grp = 1 if AppConfig.is_group_chat_id(u) else 0
                         u_cur.execute(
                             "INSERT OR REPLACE INTO wx_contacts (username, nick_name, remark, alias, is_group) VALUES (?, ?, ?, ?, ?)",
                             (u, (row["n"] or "").strip(), (row["r"] or "").strip(), (row["a"] or "").strip(), is_grp),
@@ -1337,10 +1369,13 @@ class SnapshotManager:
         else:
             is_from_me = 1 if (my_account_wxid and resolved_sender == my_account_wxid) else 0
 
+        is_grp = AppConfig.is_group_chat_id(chat_id)
         if is_from_me and my_account_wxid and not resolved_sender:
             resolved_sender = my_account_wxid
+        elif not is_from_me and not resolved_sender and not is_grp:
+            resolved_sender = chat_id
 
-        if resolved_sender and not resolved_sender.endswith("@chatroom"):
+        if is_grp and resolved_sender and not AppConfig.is_group_chat_id(resolved_sender):
             u_cur.execute(
                 "INSERT OR IGNORE INTO wx_group_members (chat_id, member_wxid, group_nickname) VALUES (?, ?, '')",
                 (chat_id, resolved_sender),
@@ -1400,12 +1435,13 @@ class SnapshotManager:
                             CompressContent AS comp,
                             BytesExtra AS extra
                         FROM MSG
-                        WHERE StrTalker LIKE '%@chatroom'
+                        WHERE StrTalker IS NOT NULL AND StrTalker != ''
                         """
                     )
                     per_chat_stats: dict[str, list[int]] = {}
                     for r in m_cur.fetchall():
                         talker = str(r["talker"] or "").strip()
+                        is_grp = AppConfig.is_group_chat_id(talker)
                         lid = int(r["lid"] or 0)
                         is_from_me = 1 if int(r["is_sender"] or 0) == 1 else 0
                         raw_c = r["content"] or ""
@@ -1413,8 +1449,12 @@ class SnapshotManager:
                         extra_b = bytes(r["extra"]) if isinstance(r["extra"], (bytes, bytearray)) else None
                         mtype = int(r["mtype"] or 1)
                         parsed = parse_wechat_message_payload(mtype, raw_c, comp_c, extra_b)
-                        sender_wxid = my_account_wxid if is_from_me else (parsed.sender_wxid_from_prefix or "")
-                        if sender_wxid and not sender_wxid.endswith("@chatroom"):
+                        sender_wxid = (
+                            my_account_wxid
+                            if is_from_me
+                            else (parsed.sender_wxid_from_prefix or ("" if is_grp else talker))
+                        )
+                        if is_grp and sender_wxid and not AppConfig.is_group_chat_id(sender_wxid):
                             u_cur.execute(
                                 "INSERT OR IGNORE INTO wx_group_members (chat_id, member_wxid, group_nickname) VALUES (?, ?, '')",
                                 (talker, sender_wxid),
@@ -1451,8 +1491,12 @@ class SnapshotManager:
                 prefix_kind = m_match.group(1).lower()
                 table_md5 = m_match.group(2).lower()
                 chat_id = md5_to_chat_id.get(table_md5)
-                if not chat_id or not chat_id.endswith("@chatroom"):
-                    continue
+                if not chat_id:
+                    m_cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                    if int((m_cur.fetchone() or [0])[0] or 0) == 0:
+                        continue
+                    chat_id = f"unknown_{table_md5[:12]}"
+                is_grp = AppConfig.is_group_chat_id(chat_id)
 
                 m_cur.execute(f"PRAGMA table_info({tbl})")
                 cols = {r[1] for r in m_cur.fetchall()}
@@ -1486,8 +1530,12 @@ class SnapshotManager:
                         raw_c = r["content"] or ""
                         mtype = int(r["mtype"] or 1)
                         parsed = parse_wechat_message_payload(mtype, raw_c, None, None)
-                        sender_wxid = my_account_wxid if is_from_me else (parsed.sender_wxid_from_prefix or "")
-                        if sender_wxid and not sender_wxid.endswith("@chatroom"):
+                        sender_wxid = (
+                            my_account_wxid
+                            if is_from_me
+                            else (parsed.sender_wxid_from_prefix or ("" if is_grp else chat_id))
+                        )
+                        if is_grp and sender_wxid and not AppConfig.is_group_chat_id(sender_wxid):
                             u_cur.execute(
                                 "INSERT OR IGNORE INTO wx_group_members (chat_id, member_wxid, group_nickname) VALUES (?, ?, '')",
                                 (chat_id, sender_wxid),
@@ -1577,12 +1625,13 @@ class SnapshotManager:
                         """
                         SELECT StrTalker AS talker, COALESCE(MAX(localId), 0) AS mx, COUNT(*) AS cnt
                         FROM MSG
-                        WHERE StrTalker LIKE '%@chatroom'
+                        WHERE StrTalker IS NOT NULL AND StrTalker != ''
                         GROUP BY StrTalker
                         """
                     )
                     for stat_row in m_cur.fetchall():
                         cid = str(stat_row["talker"] or "").strip()
+                        is_grp_cid = AppConfig.is_group_chat_id(cid)
                         cur_max = int(stat_row["mx"] or 0)
                         cur_cnt = int(stat_row["cnt"] or 0)
                         seen_chats_in_shard.add(cid)
@@ -1629,7 +1678,11 @@ class SnapshotManager:
                             extra_b = bytes(r["extra"]) if isinstance(r["extra"], (bytes, bytearray)) else None
                             mtype = int(r["mtype"] or 1)
                             parsed = parse_wechat_message_payload(mtype, raw_c, comp_c, extra_b)
-                            sender_wxid = my_account_wxid if is_from_me else (parsed.sender_wxid_from_prefix or "")
+                            sender_wxid = (
+                                my_account_wxid
+                                if is_from_me
+                                else (parsed.sender_wxid_from_prefix or ("" if is_grp_cid else cid))
+                            )
                             search_txt = _build_materialized_search_text(mtype, raw_c, comp_c, extra_b, pre_parsed=parsed)
                             if lid in existing_map:
                                 if existing_map[lid] != (mtype, raw_c):
@@ -1643,7 +1696,7 @@ class SnapshotManager:
                                     )
                                     mutated_existing = True
                             else:
-                                if sender_wxid and not sender_wxid.endswith("@chatroom"):
+                                if is_grp_cid and sender_wxid and not AppConfig.is_group_chat_id(sender_wxid):
                                     u_cur.execute(
                                         "INSERT OR IGNORE INTO wx_group_members (chat_id, member_wxid, group_nickname) VALUES (?, ?, '')",
                                         (cid, sender_wxid),
@@ -1673,8 +1726,12 @@ class SnapshotManager:
                 prefix_kind = m_match.group(1).lower()
                 table_md5 = m_match.group(2).lower()
                 chat_id = md5_to_chat_id.get(table_md5)
-                if not chat_id or not chat_id.endswith("@chatroom"):
-                    continue
+                if not chat_id:
+                    m_cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                    if int((m_cur.fetchone() or [0])[0] or 0) == 0:
+                        continue
+                    chat_id = f"unknown_{table_md5[:12]}"
+                is_grp = AppConfig.is_group_chat_id(chat_id)
 
                 seen_chats_in_shard.add(chat_id)
                 m_cur.execute(f"PRAGMA table_info({tbl})")
@@ -1687,7 +1744,7 @@ class SnapshotManager:
                 prev_max, prev_cnt = prev_watermarks.get((shard_name, chat_id), (0, 0))
                 updated_watermarks[(shard_name, chat_id)] = (cur_max, cur_cnt)
 
-                # Reconcile deleted messages (e.g. user cleared chat history in this group)
+                # Reconcile deleted messages (e.g. user cleared chat history)
                 if cur_cnt < prev_cnt or cur_max < prev_max:
                     m_cur.execute(f"SELECT {lid_col} FROM {tbl}")
                     live_lids = {int(x[0]) for x in m_cur.fetchall()}
@@ -1747,7 +1804,11 @@ class SnapshotManager:
                         raw_c = r["content"] or ""
                         mtype = int(r["mtype"] or 1)
                         parsed = parse_wechat_message_payload(mtype, raw_c, None, None)
-                        sender_wxid = my_account_wxid if is_from_me else (parsed.sender_wxid_from_prefix or "")
+                        sender_wxid = (
+                            my_account_wxid
+                            if is_from_me
+                            else (parsed.sender_wxid_from_prefix or ("" if is_grp else chat_id))
+                        )
                         search_txt = _build_materialized_search_text(mtype, raw_c, None, None, pre_parsed=parsed)
                         if lid in existing_recent:
                             if existing_recent[lid] != (mtype, raw_c):
@@ -1761,7 +1822,7 @@ class SnapshotManager:
                                 )
                                 mutated_existing = True
                         else:
-                            if sender_wxid and not sender_wxid.endswith("@chatroom"):
+                            if is_grp and sender_wxid and not AppConfig.is_group_chat_id(sender_wxid):
                                 u_cur.execute(
                                     "INSERT OR IGNORE INTO wx_group_members (chat_id, member_wxid, group_nickname) VALUES (?, ?, '')",
                                     (chat_id, sender_wxid),

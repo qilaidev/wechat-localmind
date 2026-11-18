@@ -1,3 +1,3 @@
-"""WeChat-LocalMind: macOS & Windows WeChat Local Group Data Extraction Capability Layer (CLI & MCP)."""
+"""WeChat-LocalMind: macOS & Windows WeChat Local Chat Data Extraction Capability Layer (CLI & MCP)."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

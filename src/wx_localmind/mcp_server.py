@@ -9,10 +9,11 @@ from typing import Any
 
 from . import __version__
 from .config import AppConfig
-from .constants import DEFAULT_FETCH_LIMIT
+from .constants import DEFAULT_FETCH_LIMIT, VALID_CHAT_TYPES
 from .db import QueryEngine
 from .errors import UsageError, WXLocalMindError
 from .formatter import (
+    format_chats_markdown,
     format_fetch_markdown,
     format_groups_markdown,
     format_json_output,
@@ -30,9 +31,48 @@ READONLY_TOOL_ANNOTATIONS: dict[str, Any] = {
 
 MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
+        "name": "wechat_list_chats",
+        "description": (
+            "List accessible macOS/Windows WeChat chat sessions across 1-on-1 direct chats (wxid_* / custom aliases / filehelper), "
+            "group chats (@chatroom / @im.chatroom), and official accounts (gh_*), including chat_id, chat_name, "
+            "chat_type, latest_msg_id cursor, 24h message count, and member count."
+        ),
+        "annotations": dict(READONLY_TOOL_ANNOTATIONS),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "chat_type": {
+                    "type": "string",
+                    "enum": list(VALID_CHAT_TYPES),
+                    "description": "Filter by session type: 'all' (default), 'direct', 'group', or 'official'.",
+                    "default": "all",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "Optional case-insensitive keyword filter for chat name, wxid, or alias.",
+                },
+                "include_blocked": {
+                    "type": "boolean",
+                    "description": "Whether to include chats blocked by current scope or blacklist/whitelist policy.",
+                    "default": False,
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["json", "markdown"],
+                    "default": "json",
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "Force immediate SQLCipher decryption and SQLite snapshot refresh.",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
         "name": "wechat_list_groups",
         "description": (
-            "List accessible macOS/Windows WeChat group chats (@chatroom), including chat_id, "
+            "List accessible macOS/Windows WeChat group chats (@chatroom / @im.chatroom), including chat_id, "
             "group_name, latest_msg_id cursor, 24h message count, and member count."
         ),
         "annotations": dict(READONLY_TOOL_ANNOTATIONS),
@@ -64,9 +104,10 @@ MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "name": "wechat_fetch_messages",
         "description": (
-            "Fetch cleaned WeChat group messages by incremental cursor (after_msg_id) "
-            "or time window (since). Automatically resolves 4-tier real names (remark > group nick > nick > wxid), "
-            "@mentions, 150-char <refermsg> reply chains, filters out revoked messages, and prepends context buffer messages."
+            "Fetch cleaned WeChat messages across 1-on-1 direct chats, group chats, or official accounts by "
+            "incremental cursor (after_msg_id) or time window (since). Automatically resolves 4-tier real names "
+            "(remark > group nick > nick > wxid), @mentions, 150-char <refermsg> reply chains, filters out revoked "
+            "messages, and prepends context buffer messages."
         ),
         "annotations": dict(READONLY_TOOL_ANNOTATIONS),
         "inputSchema": {
@@ -75,7 +116,16 @@ MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "chat_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Array of group chat_ids (@chatroom) or ['ALL_ALLOWED'].",
+                    "description": (
+                        "Array of WeChat chat_ids (wxid_*, alias, @chatroom, gh_*, filehelper) "
+                        "or ['ALL_ALLOWED'] / ['ALL_DIRECT'] / ['ALL_GROUPS'] / ['ALL_OFFICIAL']."
+                    ),
+                },
+                "chat_type": {
+                    "type": "string",
+                    "enum": list(VALID_CHAT_TYPES),
+                    "description": "Optional session type filter ('all', 'direct', 'group', 'official').",
+                    "default": "all",
                 },
                 "after_msg_id": {
                     "type": "integer",
@@ -97,7 +147,7 @@ MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 },
                 "limit_per_chat": {
                     "type": "integer",
-                    "description": "Max messages per group chat (default 500, max 3000).",
+                    "description": "Max messages per chat session (default 500, max 3000).",
                     "default": 500,
                 },
                 "fold_noise": {
@@ -122,8 +172,8 @@ MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "name": "wechat_search_messages",
         "description": (
-            "Search keyword across allowed WeChat group chats (including zstd-compressed XML messages) "
-            "and return matching messages with surrounding context messages."
+            "Search keyword across allowed WeChat 1-on-1 direct chats, group chats, and official accounts "
+            "(including zstd-compressed XML messages) and return matching messages with surrounding context."
         ),
         "annotations": dict(READONLY_TOOL_ANNOTATIONS),
         "inputSchema": {
@@ -136,7 +186,13 @@ MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "chat_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional list of group chat_ids (@chatroom) or ['ALL_ALLOWED'].",
+                    "description": "Optional list of chat_ids or ['ALL_ALLOWED'] / ['ALL_DIRECT'] / ['ALL_GROUPS'].",
+                },
+                "chat_type": {
+                    "type": "string",
+                    "enum": list(VALID_CHAT_TYPES),
+                    "description": "Optional session type filter ('all', 'direct', 'group', 'official').",
+                    "default": "all",
                 },
                 "since": {
                     "type": "string",
@@ -168,8 +224,8 @@ MCP_TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "name": "wechat_export_media",
         "description": (
-            "Safely export local WeChat group media attachments (automatically decoding .dat XOR images to .jpg/.png, "
-            "voice .silk/.aud, documents .pdf/.xlsx) by msg_id to the shared snapshot/media directory."
+            "Safely export local WeChat media attachments from allowed chats (automatically decoding .dat XOR / "
+            "V1-V2 AES+XOR images to .jpg/.png, voice .silk/.aud, documents .pdf/.xlsx) by msg_id."
         ),
         "annotations": dict(READONLY_TOOL_ANNOTATIONS),
         "inputSchema": {
@@ -199,7 +255,6 @@ def _execute_mcp_tool(
     arguments: dict[str, Any],
     config_path: Path | None = None,
 ) -> tuple[str, bool]:
-    # Validate tool name and argument type BEFORE touching snapshot decryption
     if name not in VALID_MCP_TOOL_NAMES:
         return json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False), True
     if not isinstance(arguments, dict):
@@ -209,6 +264,18 @@ def _execute_mcp_tool(
     snap_mgr = SnapshotManager(cfg)
     fresh = bool(arguments.get("fresh", False))
     snap = snap_mgr.ensure_snapshot(force_fresh=fresh)
+
+    if name == "wechat_list_chats":
+        with QueryEngine(cfg, snap) as engine:
+            res = engine.list_chats(
+                keyword=arguments.get("keyword"),
+                include_blocked=bool(arguments.get("include_blocked", False)),
+                chat_type=str(arguments.get("chat_type", "all")),
+            )
+        fmt = arguments.get("format", "json")
+        if fmt in ("md", "markdown"):
+            return format_chats_markdown(res), False
+        return format_json_output(res), False
 
     if name == "wechat_list_groups":
         with QueryEngine(cfg, snap) as engine:
@@ -233,6 +300,7 @@ def _execute_mcp_tool(
                 until_str=arguments.get("until"),
                 context_buffer_count=arguments.get("context_buffer"),
                 limit_per_chat=int(arguments.get("limit_per_chat", DEFAULT_FETCH_LIMIT)),
+                chat_type=str(arguments.get("chat_type", "all")),
             )
         fmt = arguments.get("format", "markdown")
         if fmt == "json":
@@ -255,6 +323,7 @@ def _execute_mcp_tool(
                 since_str=arguments.get("since"),
                 context_window=int(arguments.get("context", 3)),
                 limit=int(arguments.get("limit", 50)),
+                chat_type=str(arguments.get("chat_type", "all")),
             )
         fmt = arguments.get("format", "markdown")
         if fmt == "json":
@@ -286,7 +355,6 @@ def _dispatch_single_rpc(req: Any, config_path: Path | None) -> dict[str, Any] |
     method = req.get("method", "")
     raw_params = req.get("params")
 
-    # JSON-RPC 2.0 notifications (e.g. `notifications/initialized`) carry no `id` and expect no reply
     if req_id is None:
         return None
 

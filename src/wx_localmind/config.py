@@ -1,4 +1,4 @@
-"""Configuration management for WeChat-LocalMind (Identity anchor, Keys, Blacklist/Whitelist, Cleaning rules)."""
+"""Configuration management for WeChat-LocalMind (Identity anchor, Keys, Chat Scope, Blacklist/Whitelist, Cleaning rules)."""
 
 from __future__ import annotations
 
@@ -17,8 +17,24 @@ from .constants import (
     DEFAULT_SNAPSHOT_DIR,
     DEFAULT_SNAPSHOT_TTL_SEC,
     DEFAULT_WX_DATA_DIR,
+    OFFICIAL_SYSTEM_IDS,
+    VALID_CHAT_SCOPES,
 )
 from .errors import PolicyDeniedError, UsageError
+
+
+def classify_wx_chat_id(chat_id: str | None) -> str:
+    """Classify a WeChat username/talker ID into 'group', 'official', 'direct', or 'unknown'."""
+    if not chat_id:
+        return "unknown"
+    s = chat_id.strip()
+    if not s:
+        return "unknown"
+    if s.endswith("@chatroom") or s.endswith("@im.chatroom"):
+        return "group"
+    if s.startswith("gh_") or s in OFFICIAL_SYSTEM_IDS:
+        return "official"
+    return "direct"
 
 
 @dataclass
@@ -39,16 +55,17 @@ class CleaningConfig:
 
 @dataclass
 class AppConfig:
-    filter_mode: str = "blacklist"  # "blacklist" | "whitelist"
+    chat_scope: str = "all"          # "all" | "groups" | "direct" | "official"
+    filter_mode: str = "blacklist"   # "blacklist" | "whitelist"
     blacklist_chats: list[str] = field(default_factory=list)
     whitelist_chats: list[str] = field(default_factory=list)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     cleaning: CleaningConfig = field(default_factory=CleaningConfig)
     wx_data_dir: str = str(DEFAULT_WX_DATA_DIR)
-    account_dir: str = ""  # Optional explicit account dir (e.g. wxid_xxx_e948)
-    raw_key_hex: str = ""  # Global or default 64-hex SQLCipher key
+    account_dir: str = ""            # Optional explicit account dir (e.g. wxid_xxx_e948)
+    raw_key_hex: str = ""            # Global or default 64-hex SQLCipher key
     db_keys: dict[str, str] = field(default_factory=dict)  # Per-db or salt->key mapping
-    dat_aes_key: str = ""  # Optional 16-byte ASCII or 32-hex AES key for WeChat 4.x V1/V2 .dat images
+    dat_aes_key: str = ""            # Optional 16-byte ASCII or 32-hex AES key for WeChat 4.x V1/V2 .dat images
     keys_file: str = str(DEFAULT_KEYS_PATH)
     snapshot_dir: str = str(DEFAULT_SNAPSHOT_DIR)
 
@@ -75,6 +92,10 @@ class AppConfig:
             os.environ.get("WECHAT_LOCALMIND_DAT_KEY")
             or os.environ.get("WX_LOCALMIND_DAT_KEY")
         )
+        env_scope = (
+            os.environ.get("WECHAT_LOCALMIND_CHAT_SCOPE")
+            or os.environ.get("WX_LOCALMIND_CHAT_SCOPE")
+        )
 
         if not path.exists():
             cfg = cls()
@@ -86,7 +107,15 @@ class AppConfig:
 
             identity_raw = raw.get("identity", {})
             cleaning_raw = raw.get("cleaning", {})
+            raw_scope = str(raw.get("chat_scope", "all")).strip().lower() or "all"
+            if raw_scope == "group":
+                raw_scope = "groups"
+            if raw_scope not in VALID_CHAT_SCOPES:
+                raise UsageError(
+                    f"Invalid chat_scope '{raw_scope}' in {path}. Expected one of {VALID_CHAT_SCOPES}."
+                )
             cfg = cls(
+                chat_scope=raw_scope,
                 filter_mode=raw.get("filter_mode", "blacklist"),
                 blacklist_chats=list(raw.get("blacklist_chats", [])),
                 whitelist_chats=list(raw.get("whitelist_chats", [])),
@@ -125,6 +154,15 @@ class AppConfig:
             cfg.raw_key_hex = env_raw_key.strip()
         if env_dat_key:
             cfg.dat_aes_key = env_dat_key.strip()
+        if env_scope:
+            norm_scope = env_scope.strip().lower()
+            if norm_scope == "group":
+                norm_scope = "groups"
+            if norm_scope not in VALID_CHAT_SCOPES:
+                raise UsageError(
+                    f"Invalid WECHAT_LOCALMIND_CHAT_SCOPE '{env_scope}'. Expected one of {VALID_CHAT_SCOPES}."
+                )
+            cfg.chat_scope = norm_scope
 
         # Also merge keys from keys_file if it exists
         keys_path = Path(os.path.expanduser(cfg.keys_file))
@@ -181,26 +219,51 @@ class AppConfig:
 
     @staticmethod
     def is_group_chat_id(chat_id: str) -> bool:
-        return bool(chat_id and chat_id.endswith("@chatroom"))
+        return bool(chat_id and (chat_id.endswith("@chatroom") or chat_id.endswith("@im.chatroom")))
 
-    def is_chat_allowed(self, chat_id: str) -> bool:
-        """Strictly enforce 100% private chat blocking and group blacklist/whitelist."""
-        if not self.is_group_chat_id(chat_id):
+    @staticmethod
+    def is_valid_chat_id(chat_id: str) -> bool:
+        if not chat_id:
             return False
-        if self.filter_mode == "whitelist":
-            return chat_id in self.whitelist_chats
-        return chat_id not in self.blacklist_chats
+        s = chat_id.strip()
+        return bool(s and "/" not in s and "\\" not in s and "\x00" not in s)
 
-    def assert_chat_allowed(self, chat_id: str) -> None:
-        """Raise PolicyDeniedError (Exit Code 3) if session is private or blocked."""
-        if not self.is_group_chat_id(chat_id):
+    def is_chat_in_scope(self, chat_id: str) -> bool:
+        ctype = classify_wx_chat_id(chat_id)
+        if ctype == "unknown":
+            return False
+        scope = (self.chat_scope or "all").lower()
+        if scope == "all":
+            return True
+        if scope in ("groups", "group"):
+            return ctype == "group"
+        if scope == "direct":
+            return ctype == "direct"
+        if scope == "official":
+            return ctype == "official"
+        return True
+
+    def is_chat_allowed(self, chat_id: str, alias_id: str | None = None) -> bool:
+        """Check whether a WeChat chat session is allowed under `chat_scope` and blacklist/whitelist rules."""
+        if not self.is_chat_in_scope(chat_id):
+            return False
+        candidates = {chat_id}
+        if alias_id:
+            candidates.add(alias_id)
+        if self.filter_mode == "whitelist":
+            return bool(candidates & set(self.whitelist_chats))
+        return not bool(candidates & set(self.blacklist_chats))
+
+    def assert_chat_allowed(self, chat_id: str, alias_id: str | None = None) -> None:
+        """Raise PolicyDeniedError (Exit Code 3) if session is out of scope or blocked."""
+        ctype = classify_wx_chat_id(chat_id)
+        if not self.is_chat_in_scope(chat_id):
             raise PolicyDeniedError(
-                f"Access denied: '{chat_id}' is not a WeChat group chatroom (@chatroom). "
-                "1-on-1 private chats (wxid_*) and official accounts (gh_*) are strictly blocked.",
-                error_code="PRIVATE_SESSION_BLOCKED",
+                f"Access denied: WeChat chat '{chat_id}' (type={ctype}) is outside configured chat_scope='{self.chat_scope}'.",
+                error_code="CHAT_SCOPE_DENIED",
             )
-        if not self.is_chat_allowed(chat_id):
+        if not self.is_chat_allowed(chat_id, alias_id=alias_id):
             raise PolicyDeniedError(
-                f"Access denied: group '{chat_id}' is blocked by current {self.filter_mode} policy.",
-                error_code="GROUP_BLOCKED_BY_POLICY",
+                f"Access denied: WeChat chat '{chat_id}' is blocked by current {self.filter_mode} policy.",
+                error_code="CHAT_BLOCKED_BY_POLICY",
             )
